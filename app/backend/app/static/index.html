@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VitalTrack Prototype UI</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f7fb; }
+    h1 { margin: 0 0 8px 0; }
+    .muted { color: #667; font-size: 13px; }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+    .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 8px rgba(0,0,0,.08); padding: 14px; }
+    input, select, button { padding: 8px; margin: 4px 4px 4px 0; }
+    button { cursor: pointer; }
+    .hidden { display: none; }
+    .role-banner { padding: 8px; border-radius: 8px; margin-top: 6px; background: #e7f0ff; }
+    pre { background: #0f1626; color: #e5f0ff; border-radius: 8px; padding: 10px; max-height: 230px; overflow: auto; }
+    .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: #999; }
+    .ok { background: #1f9d43; }
+    .bad { background: #ce2d2d; }
+  </style>
+</head>
+<body>
+  <h1>VitalTrack Smart Monitoring</h1>
+  <div class="muted">Role-based prototype: Admin, Doctor, Patient, Caregiver (Relative), Simulator flows.</div>
+
+  <div class="grid">
+    <section class="card">
+      <h3>Account Login</h3>
+      <input id="loginUsername" value="doctor1" placeholder="username" />
+      <input id="loginPassword" value="doctor123" type="password" placeholder="password" />
+      <button onclick="login()">Login</button>
+      <button onclick="loginSimulator()">Use Simulator Token</button>
+      <div id="loginStatus" class="role-banner">Not logged in</div>
+    </section>
+
+    <section class="card">
+      <h3>Create Account (Patient / Caregiver)</h3>
+      <input id="regUsername" placeholder="new username" />
+      <input id="regPassword" type="password" placeholder="new password" />
+      <select id="regRole">
+        <option value="PATIENT">PATIENT</option>
+        <option value="CAREGIVER">CAREGIVER</option>
+      </select>
+      <input id="regFullName" placeholder="full name (required for patient)" />
+      <button onclick="registerSelf()">Create Account</button>
+    </section>
+  </div>
+
+  <div id="doctorSection" class="card hidden">
+    <h3>Doctor Dashboard</h3>
+    <button onclick="loadDoctorDashboard()">Load Open Alerts</button>
+    <input id="ackId" type="number" placeholder="alert id" />
+    <button onclick="ackAlert()">Acknowledge Alert</button>
+    <button onclick="retryFailed()">Retry Failed Notifications</button>
+    <button onclick="refreshQueueHealth()">Queue Health</button>
+    <div><span id="queueDot" class="status-dot"></span><span id="queueText">Queue not checked</span></div>
+  </div>
+
+  <div id="patientSection" class="card hidden">
+    <h3>Patient Portal</h3>
+    <button onclick="loadPatientPortal()">Load My Health Data</button>
+  </div>
+
+  <div id="caregiverSection" class="card hidden">
+    <h3>Caregiver (Relative) Dashboard</h3>
+    <button onclick="loadCaregiverDashboard()">Load Assigned Patients</button>
+  </div>
+
+  <div id="adminSection" class="card hidden">
+    <h3>Admin Operations</h3>
+    <div>
+      <input id="adminUsername" placeholder="username" />
+      <input id="adminPassword" type="password" placeholder="password" />
+      <select id="adminRole">
+        <option>DOCTOR</option>
+        <option>PATIENT</option>
+        <option>CAREGIVER</option>
+        <option>SIMULATOR</option>
+        <option>ADMIN</option>
+      </select>
+      <input id="adminFullName" placeholder="full name if patient" />
+      <button onclick="adminCreateUser()">Create User</button>
+    </div>
+    <div>
+      <input id="assignCaregiverUsername" placeholder="caregiver username" />
+      <input id="assignPatientId" type="number" placeholder="patient id" />
+      <button onclick="assignCaregiver()">Assign Caregiver to Patient</button>
+      <button onclick="listPatients()">List Patients</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Vitals Ingestion (Simulator/Doctor/Admin)</h3>
+    <input id="patientId" type="number" value="1" />
+    <input id="hr" type="number" value="138" />
+    <input id="spo2" type="number" step="0.1" value="86" />
+    <input id="bpSys" type="number" value="160" />
+    <input id="bpDia" type="number" value="95" />
+    <input id="temp" type="number" step="0.1" value="38.8" />
+    <button onclick="sendVitals()">Send Vitals</button>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h3>WebSocket Events</h3>
+      <pre id="events"></pre>
+    </section>
+    <section class="card">
+      <h3>API Output</h3>
+      <pre id="out"></pre>
+    </section>
+  </div>
+
+  <script>
+    let userToken = "";
+    let simulatorToken = "";
+    let currentRole = "";
+    let ws = null;
+
+    function write(id, data) {
+      const el = document.getElementById(id);
+      el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    }
+
+    function showByRole(role) {
+      currentRole = role || "";
+      document.getElementById("doctorSection").classList.toggle("hidden", !(role === "DOCTOR" || role === "ADMIN"));
+      document.getElementById("patientSection").classList.toggle("hidden", role !== "PATIENT");
+      document.getElementById("caregiverSection").classList.toggle("hidden", role !== "CAREGIVER");
+      document.getElementById("adminSection").classList.toggle("hidden", role !== "ADMIN");
+      document.getElementById("loginStatus").textContent = role ? `Logged in role: ${role}` : "Not logged in";
+    }
+
+    function parseJwt(token) {
+      try {
+        const payload = token.split(".")[1];
+        return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+      } catch (_) {
+        return {};
+      }
+    }
+
+    async function tokenRequest(username, password) {
+      const form = new URLSearchParams();
+      form.append("username", username);
+      form.append("password", password);
+      const r = await fetch("/auth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form
+      });
+      return r.json();
+    }
+
+    async function login() {
+      const username = document.getElementById("loginUsername").value;
+      const password = document.getElementById("loginPassword").value;
+      const data = await tokenRequest(username, password);
+      userToken = data.access_token || "";
+      if (!userToken) {
+        showByRole("");
+        write("out", data);
+        return;
+      }
+      const claims = parseJwt(userToken);
+      showByRole(claims.role || "");
+      connectWS();
+      write("out", { login: "ok", claims });
+    }
+
+    async function loginSimulator() {
+      const data = await tokenRequest("simulator", "sim123");
+      simulatorToken = data.access_token || "";
+      write("out", simulatorToken ? "Simulator token loaded" : data);
+    }
+
+    async function registerSelf() {
+      const payload = {
+        username: document.getElementById("regUsername").value,
+        password: document.getElementById("regPassword").value,
+        role: document.getElementById("regRole").value,
+        full_name: document.getElementById("regFullName").value || null
+      };
+      const r = await fetch("/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      write("out", await r.json());
+    }
+
+    function connectWS() {
+      if (!userToken) {
+        return;
+      }
+      if (ws) ws.close();
+      const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+      ws = new WebSocket(`${wsBase}/ws/doctor?token=${encodeURIComponent(userToken)}`);
+      ws.onopen = () => ws.send("connected");
+      ws.onmessage = (e) => {
+        const el = document.getElementById("events");
+        el.textContent = e.data + "\n" + el.textContent;
+      };
+    }
+
+    function authHeader(token) {
+      return { "Authorization": `Bearer ${token}` };
+    }
+
+    async function sendVitals() {
+      const token = simulatorToken || userToken;
+      if (!token) {
+        write("out", "Login (or get simulator token) first.");
+        return;
+      }
+      const payload = {
+        patient_id: Number(document.getElementById("patientId").value),
+        heart_rate: Number(document.getElementById("hr").value),
+        spo2: Number(document.getElementById("spo2").value),
+        bp_sys: Number(document.getElementById("bpSys").value),
+        bp_dia: Number(document.getElementById("bpDia").value),
+        temperature: Number(document.getElementById("temp").value),
+        source: "simulator-ui"
+      };
+      const r = await fetch("/v1/vitals", {
+        method: "POST",
+        headers: { ...authHeader(token), "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      write("out", await r.json());
+    }
+
+    async function loadDoctorDashboard() {
+      const r = await fetch("/v1/doctor/dashboard", { headers: authHeader(userToken) });
+      write("out", await r.json());
+    }
+
+    async function ackAlert() {
+      const id = Number(document.getElementById("ackId").value);
+      const r = await fetch(`/v1/alerts/${id}/ack`, {
+        method: "POST",
+        headers: authHeader(userToken)
+      });
+      write("out", await r.json());
+    }
+
+    async function retryFailed() {
+      const r = await fetch("/v1/failed-events/retry", {
+        method: "POST",
+        headers: authHeader(userToken)
+      });
+      write("out", await r.json());
+    }
+
+    function setQueueStatus(ok, text) {
+      const dot = document.getElementById("queueDot");
+      dot.classList.remove("ok", "bad");
+      dot.classList.add(ok ? "ok" : "bad");
+      document.getElementById("queueText").textContent = text;
+    }
+
+    async function refreshQueueHealth() {
+      const r = await fetch("/v1/queue/health", { headers: authHeader(userToken) });
+      const data = await r.json();
+      if (data.connected) {
+        setQueueStatus(true, `Connected, messages=${data.messages}, consumers=${data.consumers}`);
+      } else {
+        setQueueStatus(false, data.error || "unavailable");
+      }
+      write("out", data);
+    }
+
+    async function loadPatientPortal() {
+      const r = await fetch("/v1/patient/portal", { headers: authHeader(userToken) });
+      write("out", await r.json());
+    }
+
+    async function loadCaregiverDashboard() {
+      const r = await fetch("/v1/caregiver/dashboard", { headers: authHeader(userToken) });
+      write("out", await r.json());
+    }
+
+    async function adminCreateUser() {
+      const payload = {
+        username: document.getElementById("adminUsername").value,
+        password: document.getElementById("adminPassword").value,
+        role: document.getElementById("adminRole").value,
+        full_name: document.getElementById("adminFullName").value || null
+      };
+      const r = await fetch("/v1/admin/users", {
+        method: "POST",
+        headers: { ...authHeader(userToken), "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      write("out", await r.json());
+    }
+
+    async function assignCaregiver() {
+      const payload = {
+        caregiver_username: document.getElementById("assignCaregiverUsername").value,
+        patient_id: Number(document.getElementById("assignPatientId").value)
+      };
+      const r = await fetch("/v1/admin/caregiver-assignments", {
+        method: "POST",
+        headers: { ...authHeader(userToken), "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      write("out", await r.json());
+    }
+
+    async function listPatients() {
+      const r = await fetch("/v1/admin/patients", { headers: authHeader(userToken) });
+      write("out", await r.json());
+    }
+  </script>
+</body>
+</html>

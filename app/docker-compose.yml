@@ -1,0 +1,81 @@
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: vitaltrack-gateway
+    depends_on:
+      frontend:
+        condition: service_started
+      ingestion:
+        condition: service_started
+      notification:
+        condition: service_started
+    ports:
+      - "8000:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+  frontend:
+    build: ./frontend
+    container_name: vitaltrack-frontend
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: vitaltrack-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: vitaltrack-db
+    environment:
+      POSTGRES_USER: vitaltrack
+      POSTGRES_PASSWORD: vitaltrack
+      POSTGRES_DB: vitaltrack
+    ports:
+      - "5433:5432"
+    volumes:
+      - vitaltrack_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vitaltrack -d vitaltrack"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ingestion:
+    build: ./backend
+    container_name: vitaltrack-ingestion
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://vitaltrack:vitaltrack@db:5432/vitaltrack
+      JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      RABBITMQ_ALERT_QUEUE: vitaltrack.alerts.created
+    command: ["uvicorn", "app.ingestion_main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  notification:
+    build: ./backend
+    container_name: vitaltrack-notification
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://vitaltrack:vitaltrack@db:5432/vitaltrack
+      JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      RABBITMQ_ALERT_QUEUE: vitaltrack.alerts.created
+    command: ["uvicorn", "app.notification_main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  vitaltrack_data:

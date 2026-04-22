@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import logging
+import os
+from pathlib import Path
+import threading
+import time
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from .auth import authenticate_user, create_access_token, get_password_hash, require_roles
+from .db import Base, engine, get_db
+from .messaging import RabbitMQBridge
+from .models import (
+    Alert,
+    AlertStatus,
+    CaregiverAssignment,
+    CaregiverLinkRequest,
+    CaregiverRequestStatus,
+    OutboxEvent,
+    OutboxStatus,
+    Patient,
+    User,
+    UserRole,
+    VitalReading,
+)
+from .schemas import RegisterRequest, RegisterResponse, VitalIngestRequest, VitalIngestResponse
+from .services import calculate_risk_score, create_audit_log, evaluate_alert
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+logger = logging.getLogger("vitaltrack.ingestion")
+
+rabbit_bridge: RabbitMQBridge | None = None
+outbox_stop_event = threading.Event()
+outbox_thread: threading.Thread | None = None
+
+
+def _publish_pending_outbox():
+    while not outbox_stop_event.is_set():
+        with Session(engine) as db:
+            rows = db.scalars(
+                select(OutboxEvent)
+                .where(OutboxEvent.status.in_([OutboxStatus.PENDING.value, OutboxStatus.FAILED.value]))
+                .order_by(OutboxEvent.created_at.asc())
+                .limit(100)
+            ).all()
+            if not rows:
+                time.sleep(0.5)
+                continue
+
+            for event in rows:
+                event.updated_at = datetime.now(timezone.utc)
+                if rabbit_bridge is None:
+                    event.status = OutboxStatus.FAILED.value
+                    event.retry_count += 1
+                    event.last_error = "RabbitMQ bridge unavailable"
+                    continue
+                published = rabbit_bridge.publish_alert_created(event.payload)
+                if published:
+                    event.status = OutboxStatus.PUBLISHED.value
+                    event.last_error = None
+                    event.published_at = datetime.now(timezone.utc)
+                else:
+                    event.status = OutboxStatus.FAILED.value
+                    event.retry_count += 1
+                    event.last_error = "RabbitMQ publish failed"
+            db.commit()
+        time.sleep(0.2)
+
+
+def start_outbox_worker():
+    global outbox_thread
+    if outbox_thread and outbox_thread.is_alive():
+        return
+    outbox_stop_event.clear()
+    outbox_thread = threading.Thread(target=_publish_pending_outbox, daemon=True)
+    outbox_thread.start()
+    logger.info("Outbox publisher started")
+
+
+def stop_outbox_worker():
+    outbox_stop_event.set()
+    if outbox_thread:
+        outbox_thread.join(timeout=3)
+    logger.info("Outbox publisher stopped")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global rabbit_bridge
+    Base.metadata.create_all(bind=engine)
+    migrate_audit_metadata_to_jsonb()
+    seed_basics()
+    init_timescale()
+    rabbit_url = os.getenv("RABBITMQ_URL", "")
+    rabbit_queue = os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created")
+    if rabbit_url:
+        rabbit_bridge = RabbitMQBridge(rabbit_url, rabbit_queue, lambda _: None)
+    start_outbox_worker()
+    yield
+    stop_outbox_worker()
+
+
+app = FastAPI(title="VitalTrack Ingestion Service", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+def root():
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.post("/auth/token")
+def token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    return {"access_token": create_access_token({"sub": user.username, "role": user.role}), "token_type": "bearer"}
+
+
+@app.post("/auth/register", response_model=RegisterResponse)
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    try:
+        role = UserRole(payload.role.upper())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid role") from exc
+
+    if role not in {UserRole.PATIENT, UserRole.CAREGIVER, UserRole.DOCTOR}:
+        raise HTTPException(status_code=400, detail="Self-registration supports PATIENT, DOCTOR, or CAREGIVER")
+
+    existing = db.scalar(select(User).where(User.username == payload.username))
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    patient_id = None
+    caregiver_request_id = None
+    caregiver_request_status = None
+    user = User(
+        username=payload.username,
+        password_hash=get_password_hash(payload.password),
+        role=role.value,
+    )
+    db.add(user)
+    db.flush()
+
+    if role == UserRole.PATIENT:
+        if not payload.full_name:
+            raise HTTPException(status_code=400, detail="full_name is required for PATIENT role")
+        patient = Patient(user_id=user.id, full_name=payload.full_name)
+        db.add(patient)
+        db.flush()
+        patient_id = patient.id
+    elif role == UserRole.CAREGIVER:
+        if payload.patient_id is None:
+            raise HTTPException(status_code=400, detail="patient_id is required for CAREGIVER role")
+        patient = db.scalar(select(Patient).where(Patient.id == payload.patient_id))
+        if patient is None:
+            raise HTTPException(status_code=404, detail="Requested patient not found")
+        request = CaregiverLinkRequest(
+            caregiver_user_id=user.id,
+            patient_id=patient.id,
+            status=CaregiverRequestStatus.PENDING.value,
+            notes="Requested during signup",
+        )
+        db.add(request)
+        db.flush()
+        caregiver_request_id = request.id
+        caregiver_request_status = request.status
+
+    db.commit()
+    return RegisterResponse(
+        user_id=user.id,
+        username=user.username,
+        role=user.role,
+        patient_id=patient_id,
+        caregiver_request_id=caregiver_request_id,
+        caregiver_request_status=caregiver_request_status,
+    )
+
+
+@app.post("/v1/vitals", response_model=VitalIngestResponse)
+def ingest_vitals(
+    payload: VitalIngestRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(UserRole.SIMULATOR, UserRole.DOCTOR, UserRole.ADMIN)),
+):
+    patient = db.scalar(select(Patient).where(Patient.id == payload.patient_id))
+    if patient is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    reading = VitalReading(
+        patient_id=payload.patient_id,
+        ts=datetime.now(timezone.utc),
+        heart_rate=payload.heart_rate,
+        spo2=payload.spo2,
+        bp_sys=payload.bp_sys,
+        bp_dia=payload.bp_dia,
+        temperature=payload.temperature,
+        source=payload.source,
+    )
+    db.add(reading)
+    db.flush()
+
+    risk_score = calculate_risk_score(reading)
+    should_alert, severity, rule_code, message = evaluate_alert(reading, risk_score)
+    alert_created = False
+    alert: Alert | None = None
+
+    if should_alert and severity is not None:
+        alert = Alert(
+            patient_id=payload.patient_id,
+            severity=severity.value,
+            rule_code=rule_code,
+            message=message,
+            status=AlertStatus.OPEN.value,
+        )
+        db.add(alert)
+        db.flush()
+        alert_created = True
+        alert_id = alert.id
+        create_audit_log(
+            db,
+            actor_username=user.username,
+            action="ALERT_CREATED",
+            target_type="ALERT",
+            target_id=str(alert.id),
+            metadata={"severity": alert.severity, "rule_code": alert.rule_code},
+        )
+
+    create_audit_log(
+        db,
+        actor_username=user.username,
+        action="VITAL_INGESTED",
+        target_type="PATIENT",
+        target_id=str(payload.patient_id),
+        metadata={"reading_id": reading.id, "risk_score": risk_score},
+    )
+    db.commit()
+
+    # Transactional outbox: enqueue alert event in the same DB transaction.
+    if alert_created and alert is not None:
+        db.add(
+            OutboxEvent(
+                event_type="ALERT_CREATED",
+                payload={"alert_id": alert_id},
+                status=OutboxStatus.PENDING.value,
+            )
+        )
+        create_audit_log(
+            db,
+            actor_username=user.username,
+            action="ALERT_EVENT_ENQUEUED",
+            target_type="OUTBOX",
+            target_id=str(alert_id),
+            metadata={"event_type": "ALERT_CREATED"},
+        )
+        db.commit()
+
+    return VitalIngestResponse(
+        reading_id=reading.id,
+        alert_created=alert_created,
+        risk_score=risk_score,
+        severity=severity.value if severity else None,
+    )
+
+
+def init_timescale():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb;"))
+            conn.execute(
+                text(
+                    """
+                    SELECT create_hypertable('vital_readings', 'ts', if_not_exists => TRUE);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_vitals_patient_ts
+                    ON vital_readings (patient_id, ts DESC);
+                    """
+                )
+            )
+    except SQLAlchemyError:
+        pass
+
+
+def migrate_audit_metadata_to_jsonb():
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'audit_logs'
+                          AND column_name = 'audit_metadata'
+                          AND udt_name <> 'jsonb'
+                    ) THEN
+                        ALTER TABLE audit_logs
+                        ALTER COLUMN audit_metadata
+                        TYPE jsonb
+                        USING audit_metadata::jsonb;
+                    END IF;
+                END $$;
+                """
+            )
+        )
+
+
+def seed_basics():
+    with Session(engine) as db:
+        existing = db.scalar(select(User).where(User.username == "admin"))
+        if existing:
+            return
+
+        users = [
+            User(username="admin", password_hash=get_password_hash("admin123"), role=UserRole.ADMIN.value),
+            User(username="doctor1", password_hash=get_password_hash("doctor123"), role=UserRole.DOCTOR.value),
+            User(username="patient1", password_hash=get_password_hash("patient123"), role=UserRole.PATIENT.value),
+            User(username="caregiver1", password_hash=get_password_hash("care123"), role=UserRole.CAREGIVER.value),
+            User(username="simulator", password_hash=get_password_hash("sim123"), role=UserRole.SIMULATOR.value),
+        ]
+        db.add_all(users)
+        db.flush()
+
+        patient = Patient(user_id=users[2].id, full_name="John Patient")
+        db.add(patient)
+        db.flush()
+        db.add(CaregiverAssignment(caregiver_user_id=users[3].id, patient_id=patient.id))
+        db.commit()
