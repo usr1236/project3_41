@@ -377,14 +377,4 @@ Then hard refresh browser (`Ctrl+Shift+R`) and click `Reconnect WebSocket` in th
 - Admin and Simulator dashboards expose observable NFR-oriented metrics (ingestion rate, active patients, outbox health, queue depth/consumers, and outbox publish latency percentiles).
 - Auto mode supports one, some, or all patient IDs simultaneously for workload and scalability demonstrations.
 
-## Additional ADRs (Latest)
 
-- **ADR-009: Admin-Mediated Caregiver-to-Patient Assignment**
-  - Caregiver linkage requests remain `PENDING` until admin approval/rejection.
-  - Approved requests create scoped caregiver-patient assignments.
-- **ADR-010: Versioned Event Envelope for Broker Messages**
-  - Broker events should carry schema-version and event-type metadata to support independent producer/consumer evolution.
-- **ADR-011: Runtime NFR Metrics Visibility for Operations Roles**
-  - Admin and Simulator roles can query a consolidated `/v1/system/metrics` endpoint to inspect reliability/performance indicators.
-- **ADR-012: Multi-Patient Auto-Mode Streaming Control**
-  - Auto mode supports concurrent generation for one, selected, or all patient IDs to validate multi-patient runtime behavior.
