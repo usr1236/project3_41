@@ -4,10 +4,10 @@ This folder contains a full working prototype for **five end-to-end workflows** 
 
 1. **E2E-1 Critical Alert Pipeline**  
    `Gateway -> Ingestion Service -> Risk/Rule Evaluation -> Alert Creation -> RabbitMQ Publish -> Notification Service Consumer -> Realtime Dashboard Event -> Audit Log`
-2. **E2E-2 Clinical Acknowledgment Pipeline**  
-   `Doctor Acknowledges Alert -> Alert Status Update -> Realtime Dashboard Event -> Audit Log`
-3. **E2E-3 Critical Escalation Pipeline**  
+2. **E2E-2 Critical Escalation Pipeline**  
    `Critical Alert Unacknowledged -> Escalation Mediator Timed Step -> Escalation Notification -> Audit Log`
+3. **E2E-3 Clinical Acknowledgment Pipeline**  
+   `Doctor Acknowledges Alert -> Alert Status Update -> Realtime Dashboard Event -> Audit Log`
 4. **E2E-4 Caregiver Approval & Access Pipeline**  
    `Caregiver Signup Request -> Admin Approval -> Scoped Caregiver Dashboard Access`
 5. **E2E-5 Chatbot Advisory Pipeline**  
