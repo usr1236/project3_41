@@ -225,6 +225,7 @@ export default function App() {
   const [events, setEvents] = useState([]);
 
   const [patientId, setPatientId] = useState(1);
+  const [patientList, setPatientList] = useState([]);
   const [vitals, setVitals] = useState({
     heart_rate: 90,
     spo2: 97,
@@ -235,20 +236,43 @@ export default function App() {
   });
   const [autoMode, setAutoMode] = useState(false);
   const [autoIntervalMs, setAutoIntervalMs] = useState(2000);
+  const [autoScope, setAutoScope] = useState("ONE");
+  const [autoSomePatientIds, setAutoSomePatientIds] = useState("1");
   const [points, setPoints] = useState([]);
   const [stats, setStats] = useState({});
+  const [systemMetrics, setSystemMetrics] = useState(null);
   const [dashboard, setDashboard] = useState(null);
   const [patientPortal, setPatientPortal] = useState(null);
   const [relativeDash, setRelativeDash] = useState(null);
   const [caregiverRequests, setCaregiverRequests] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatPatientId, setChatPatientId] = useState(1);
+  const [chatHistory, setChatHistory] = useState([]);
 
   const canIngest = ["DOCTOR", "ADMIN", "SIMULATOR"].includes(role);
+
+  const parseSomeIds = () =>
+    autoSomePatientIds
+      .split(",")
+      .map((v) => Number(v.trim()))
+      .filter((v, idx, arr) => Number.isInteger(v) && v > 0 && arr.indexOf(v) === idx);
+
+  const resolveAutoPatientIds = () => {
+    if (autoScope === "ALL") {
+      return patientList.map((p) => p.id);
+    }
+    if (autoScope === "SOME") {
+      return parseSomeIds();
+    }
+    return [patientId];
+  };
 
   useEffect(() => {
     if (!role) return;
     const target = ROLE_HOME[role] || "/";
     if (location.pathname === "/") navigate(target, { replace: true });
-  }, [role, navigate]);
+  }, [role, navigate, location.pathname]);
 
   useEffect(() => {
     if (!token || !["DOCTOR", "ADMIN"].includes(role)) {
@@ -269,20 +293,37 @@ export default function App() {
   }, [token, role, wsSeed]);
 
   useEffect(() => {
+    if (!token || !["ADMIN", "DOCTOR", "SIMULATOR"].includes(role)) return;
+    loadPatientList().catch(() => {});
+  }, [token, role]);
+
+  useEffect(() => {
     if (!autoMode || !canIngest || !token) return undefined;
+    const targetPatientIds = resolveAutoPatientIds();
+    if (!targetPatientIds.length) {
+      setOutputState("No patient IDs selected for auto mode.");
+      setAutoMode(false);
+      return undefined;
+    }
     const tick = async () => {
-      const payload = {
-        patient_id: patientId,
-        heart_rate: Math.round(65 + Math.random() * 85),
-        spo2: Number((84 + Math.random() * 15).toFixed(1)),
-        bp_sys: Math.round(100 + Math.random() * 78),
-        bp_dia: Math.round(60 + Math.random() * 44),
-        temperature: Number((36.1 + Math.random() * 3.2).toFixed(1)),
-        source: "auto-mode",
-      };
       try {
-        await api("/v1/vitals", { method: "POST", token, body: payload });
-        setOutputState(`Auto stream active for patient ${patientId}`);
+        const jobs = targetPatientIds.map((targetId) =>
+          api("/v1/vitals", {
+            method: "POST",
+            token,
+            body: {
+              patient_id: targetId,
+              heart_rate: Math.round(65 + Math.random() * 85),
+              spo2: Number((84 + Math.random() * 15).toFixed(1)),
+              bp_sys: Math.round(100 + Math.random() * 78),
+              bp_dia: Math.round(60 + Math.random() * 44),
+              temperature: Number((36.1 + Math.random() * 3.2).toFixed(1)),
+              source: "auto-mode",
+            },
+          })
+        );
+        await Promise.allSettled(jobs);
+        setOutputState(`Auto stream active for patient IDs: ${targetPatientIds.join(", ")}`);
       } catch (e) {
         setOutputState(`Auto mode failed: ${String(e)}`);
       }
@@ -290,7 +331,7 @@ export default function App() {
     tick();
     const id = window.setInterval(tick, Math.max(500, autoIntervalMs));
     return () => window.clearInterval(id);
-  }, [autoMode, autoIntervalMs, canIngest, token, patientId]);
+  }, [autoMode, autoIntervalMs, canIngest, token, patientId, autoScope, autoSomePatientIds, patientList]);
 
   const pushOutput = (data) => setOutputState(typeof data === "string" ? data : JSON.stringify(data, null, 2));
 
@@ -330,6 +371,21 @@ export default function App() {
     setToken("");
     setAutoMode(false);
     navigate("/", { replace: true });
+  };
+
+  const loadPatientList = async () => {
+    const data = await api("/v1/admin/patients", { token });
+    setPatientList(data || []);
+    if (data?.length && !data.some((p) => p.id === patientId)) {
+      setPatientId(data[0].id);
+    }
+    return data;
+  };
+
+  const loadSystemMetrics = async () => {
+    const data = await api("/v1/system/metrics", { token });
+    setSystemMetrics(data);
+    pushOutput(data);
   };
 
   const loadPatientInsights = async (targetPatientId = patientId) => {
@@ -374,6 +430,38 @@ export default function App() {
     setCaregiverRequests(data);
   };
 
+  const loadNotifications = async () => {
+    const data = await api("/v1/notifications?limit=120", { token });
+    setNotifications(data || []);
+    pushOutput({ notifications_loaded: data?.length || 0 });
+  };
+
+  const sendChatMessage = async () => {
+    if (!chatInput.trim()) return;
+    try {
+      const body = {
+        message: chatInput.trim(),
+        patient_id: Number(chatPatientId) || null,
+      };
+      const data = await api("/v1/chatbot/message", { method: "POST", token, body });
+      setChatHistory((prev) =>
+        [
+          ...prev,
+          {
+            user: chatInput.trim(),
+            reply: data.reply,
+            risk_level: data.risk_level,
+            ts: new Date().toISOString(),
+          },
+        ].slice(-30)
+      );
+      setChatInput("");
+      pushOutput(data);
+    } catch (e) {
+      pushOutput(String(e));
+    }
+  };
+
   const reviewRequest = async (requestId, approve) => {
     const path = `/v1/admin/caregiver-requests/${requestId}/${approve ? "approve" : "reject"}`;
     await api(path, { method: "POST", token, body: { notes: approve ? "Approved in portal" : "Rejected in portal" } });
@@ -409,11 +497,42 @@ export default function App() {
                     <button onClick={loadDoctorDashboard}>Load Alerts Snapshot</button>
                     <button onClick={loadRequests}>Load Relative Requests</button>
                     <button onClick={() => loadPatientInsights(patientId)}>Load Patient Charts</button>
+                    <button onClick={loadPatientList}>Refresh Patient IDs</button>
+                    <button onClick={loadSystemMetrics}>Load NFR Metrics</button>
+                    <button onClick={loadNotifications}>Load Notifications</button>
                   </div>
                   <label>
                     Patient ID
                     <input type="number" value={patientId} onChange={(e) => setPatientId(Number(e.target.value))} />
                   </label>
+                  <div className="row">
+                    <label>
+                      Auto Mode Scope
+                      <select value={autoScope} onChange={(e) => setAutoScope(e.target.value)}>
+                        <option value="ONE">One patient (Patient ID)</option>
+                        <option value="SOME">Some patient IDs (comma separated)</option>
+                        <option value="ALL">All patients</option>
+                      </select>
+                    </label>
+                    <label>
+                      Some IDs (1,2,3)
+                      <input
+                        value={autoSomePatientIds}
+                        onChange={(e) => setAutoSomePatientIds(e.target.value)}
+                        placeholder="1,2,3"
+                      />
+                    </label>
+                    <label>
+                      Auto Interval (ms)
+                      <input
+                        type="number"
+                        min="500"
+                        value={autoIntervalMs}
+                        onChange={(e) => setAutoIntervalMs(Number(e.target.value) || 2000)}
+                      />
+                    </label>
+                    <button onClick={() => setAutoMode((s) => !s)}>{autoMode ? "Stop Auto Mode" : "Start Auto Mode"}</button>
+                  </div>
                   <div className="table-wrap">
                     <table>
                       <thead>
@@ -455,6 +574,10 @@ export default function App() {
                     <StatCard label="Samples" value={stats.samples} />
                     <StatCard label="Avg Heart Rate" value={stats.heart_rate_avg} />
                     <StatCard label="Min SpO2" value={stats.spo2_min} />
+                    <StatCard label="Ingestion RPS (1m)" value={systemMetrics?.ingestion?.readings_per_second_last_minute} />
+                    <StatCard label="Outbox Pending" value={systemMetrics?.outbox?.pending} />
+                    <StatCard label="Queue Messages" value={systemMetrics?.queue?.messages} />
+                    <StatCard label="Outbox p95(s)" value={systemMetrics?.outbox?.publish_latency_p95_s_last_hour} />
                   </div>
                 </article>
               </section>
@@ -474,6 +597,22 @@ export default function App() {
                     <label>
                       Patient ID
                       <input type="number" value={patientId} onChange={(e) => setPatientId(Number(e.target.value))} />
+                    </label>
+                    <label>
+                      Auto Mode Scope
+                      <select value={autoScope} onChange={(e) => setAutoScope(e.target.value)}>
+                        <option value="ONE">One patient</option>
+                        <option value="SOME">Some IDs</option>
+                        <option value="ALL">All known patients</option>
+                      </select>
+                    </label>
+                    <label>
+                      Some IDs
+                      <input
+                        value={autoSomePatientIds}
+                        onChange={(e) => setAutoSomePatientIds(e.target.value)}
+                        placeholder="1,2,3"
+                      />
                     </label>
                     <label>
                       Auto Interval (ms)
@@ -508,8 +647,10 @@ export default function App() {
                     <button onClick={sendOneReading}>Send One Reading</button>
                     <button onClick={() => setAutoMode((s) => !s)}>{autoMode ? "Stop Auto Mode" : "Start Auto Mode"}</button>
                     <button onClick={loadDoctorDashboard}>Load Alert Dashboard</button>
+                    <button onClick={loadPatientList}>Refresh Patient IDs</button>
                     <button onClick={() => loadPatientInsights(patientId)}>Load Charts</button>
                     <button onClick={() => setWsSeed((v) => v + 1)}>Reconnect WebSocket</button>
+                    <button onClick={loadNotifications}>Load Notifications</button>
                   </div>
                 </article>
                 <article className="panel">
@@ -537,6 +678,7 @@ export default function App() {
                   <div className="row">
                     <button onClick={loadPatientPortal}>Load My Portal</button>
                     <button onClick={() => loadPatientInsights(patientId)}>Refresh Charts</button>
+                    <button onClick={loadNotifications}>Load Notifications</button>
                   </div>
                   <div className="stats-grid">
                     <StatCard label="Patient ID" value={patientPortal?.patient_id || patientId} />
@@ -561,6 +703,7 @@ export default function App() {
                   <div className="row">
                     <button onClick={loadRelativeDash}>Load Assigned Patients</button>
                     <button onClick={() => loadPatientInsights(patientId)}>Load Selected Patient Charts</button>
+                    <button onClick={loadNotifications}>Load Notifications</button>
                   </div>
                   <div className="row">
                     <label>
@@ -606,6 +749,22 @@ export default function App() {
                       <input type="number" value={patientId} onChange={(e) => setPatientId(Number(e.target.value))} />
                     </label>
                     <label>
+                      Auto Mode Scope
+                      <select value={autoScope} onChange={(e) => setAutoScope(e.target.value)}>
+                        <option value="ONE">One patient</option>
+                        <option value="SOME">Some IDs</option>
+                        <option value="ALL">All known patients</option>
+                      </select>
+                    </label>
+                    <label>
+                      Some IDs
+                      <input
+                        value={autoSomePatientIds}
+                        onChange={(e) => setAutoSomePatientIds(e.target.value)}
+                        placeholder="1,2,3"
+                      />
+                    </label>
+                    <label>
                       Auto Interval (ms)
                       <input
                         type="number"
@@ -615,7 +774,21 @@ export default function App() {
                       />
                     </label>
                     <button onClick={() => setAutoMode((v) => !v)}>{autoMode ? "Stop Stream" : "Start Stream"}</button>
+                    <button onClick={loadPatientList}>Refresh Patient IDs</button>
+                    <button onClick={loadSystemMetrics}>Load NFR Metrics</button>
                     <button onClick={() => loadPatientInsights(patientId)}>Load Charts</button>
+                    <button onClick={loadNotifications}>Load Notifications</button>
+                  </div>
+                </article>
+                <article className="panel">
+                  <h3>Simulator Metrics</h3>
+                  <div className="stats-grid">
+                    <StatCard label="Readings Last Minute" value={systemMetrics?.ingestion?.readings_last_minute} />
+                    <StatCard label="Ingestion RPS" value={systemMetrics?.ingestion?.readings_per_second_last_minute} />
+                    <StatCard label="Active Patients (15m)" value={systemMetrics?.ingestion?.active_patients_last_15m} />
+                    <StatCard label="Outbox Pending" value={systemMetrics?.outbox?.pending} />
+                    <StatCard label="Queue Messages" value={systemMetrics?.queue?.messages} />
+                    <StatCard label="Queue Consumers" value={systemMetrics?.queue?.consumers} />
                   </div>
                 </article>
               </section>
@@ -634,6 +807,69 @@ export default function App() {
           <VitalLineChart points={points} dataKey="temperature" label="Temperature Trend" unit="C" color="#ff5f5f" />
         </article>
         <article className="panel">
+          <h3>Notifications</h3>
+          <div className="row">
+            <button onClick={loadNotifications}>Refresh Notifications</button>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Alert</th>
+                  <th>Recipient</th>
+                  <th>Channel</th>
+                  <th>Status</th>
+                  <th>Details</th>
+                  <th>Created</th>
+                </tr>
+              </thead>
+              <tbody>
+                {notifications.slice(0, 80).map((n) => (
+                  <tr key={n.id}>
+                    <td>{n.id}</td>
+                    <td>{n.alert_id}</td>
+                    <td>{n.recipient}</td>
+                    <td>{n.channel}</td>
+                    <td>{n.status}</td>
+                    <td>{n.details}</td>
+                    <td>{formatTimeLabel(n.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Health Chatbot</h3>
+          <p className="muted">Non-diagnostic triage support only. No automatic alert escalation from chatbot messages.</p>
+          <div className="row">
+            <label>
+              Patient ID
+              <input
+                type="number"
+                value={chatPatientId}
+                onChange={(e) => setChatPatientId(Number(e.target.value) || 1)}
+              />
+            </label>
+            <label>
+              Message
+              <input
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder="e.g., chest pain and breathlessness"
+              />
+            </label>
+            <button onClick={sendChatMessage}>Send to Chatbot</button>
+          </div>
+          <pre>
+            {chatHistory
+              .map(
+                (c) =>
+                  `[${formatTimeLabel(c.ts)}] You: ${c.user}\nBot (${c.risk_level}): ${c.reply}`
+              )
+              .join("\n\n") || "No chatbot messages yet"}
+          </pre>
+
           <h3>Realtime Events</h3>
           <pre>{events.join("\n") || "No websocket events yet"}</pre>
           <h3>System Output</h3>

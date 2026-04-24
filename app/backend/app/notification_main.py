@@ -3,25 +3,34 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 import logging
 import os
 import time
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from openai import OpenAI
 import pika
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from .auth import get_password_hash, get_user_from_token, require_roles
 from .db import engine, get_db
-from .messaging import RabbitMQBridge
+from .messaging import RabbitMQBridge, parse_event_envelope
 from .models import (
     Alert,
+    AlertSeverity,
     AlertStatus,
     CaregiverAssignment,
     CaregiverLinkRequest,
     CaregiverRequestStatus,
+    FailedEvent,
+    FailedEventStatus,
+    Notification,
+    OutboxEvent,
+    OutboxStatus,
     Patient,
+    PredictionRecord,
     User,
     UserRole,
     VitalReading,
@@ -29,6 +38,8 @@ from .models import (
 from .schemas import (
     AckResponse,
     AdminCreateUserRequest,
+    ChatbotMessageRequest,
+    ChatbotMessageResponse,
     CaregiverAssignmentRequest,
     CaregiverDashboardResponse,
     CaregiverRequestReviewRequest,
@@ -37,6 +48,7 @@ from .schemas import (
     PatientStatsResponse,
     PatientPortalResponse,
     RegisterResponse,
+    SystemMetricsResponse,
     VitalsSeriesResponse,
 )
 from .services import (
@@ -77,10 +89,16 @@ main_loop: asyncio.AbstractEventLoop | None = None
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global rabbit_bridge, main_loop
+    global rabbit_bridge, main_loop, openai_client
     main_loop = asyncio.get_running_loop()
+    if OPENAI_CHATBOT_ENABLED:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            openai_client = OpenAI(api_key=api_key)
+        else:
+            logger.warning("OpenAI chatbot is enabled by default but OPENAI_API_KEY is missing; using local fallback.")
     rabbit_url = os.getenv("RABBITMQ_URL", "")
-    rabbit_queue = os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created")
+    rabbit_queue = os.getenv("RABBITMQ_NOTIFICATION_QUEUE", os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created"))
     if rabbit_url:
         rabbit_bridge = RabbitMQBridge(rabbit_url, rabbit_queue, handle_alert_created_event)
         rabbit_bridge.start_consumer()
@@ -91,6 +109,9 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="VitalTrack Notification Service", lifespan=lifespan)
 logger = logging.getLogger("vitaltrack.notification")
+OPENAI_CHATBOT_ENABLED = os.getenv("OPENAI_CHATBOT_ENABLED", "true").lower() not in {"0", "false", "no"}
+OPENAI_CHATBOT_MODEL = os.getenv("OPENAI_CHATBOT_MODEL", "gpt-4.1-mini")
+openai_client: OpenAI | None = None
 
 
 def _can_access_patient(db: Session, user: User, patient_id: int) -> bool:
@@ -110,9 +131,83 @@ def _can_access_patient(db: Session, user: User, patient_id: int) -> bool:
     return False
 
 
+def _chatbot_triage(message: str) -> tuple[str, str]:
+    text = message.lower()
+    high_keywords = [
+        "chest pain",
+        "shortness of breath",
+        "can't breathe",
+        "unconscious",
+        "severe bleeding",
+        "stroke",
+        "heart attack",
+    ]
+    medium_keywords = ["dizzy", "fever", "vomit", "faint", "palpitations", "headache"]
+    if any(k in text for k in high_keywords):
+        return (
+            "CRITICAL",
+            "This may indicate an emergency. Contact emergency services immediately and notify your doctor now.",
+        )
+    if any(k in text for k in medium_keywords):
+        return (
+            "MEDIUM",
+            "Your symptoms may need prompt clinician review. Please contact your care team soon and monitor vitals.",
+        )
+    return (
+        "LOW",
+        "Based on your message, this appears non-urgent. Continue routine monitoring and reach out if symptoms worsen.",
+    )
+
+
+def _chatbot_triage_openai(message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
+    if not OPENAI_CHATBOT_ENABLED or openai_client is None:
+        raise RuntimeError("OpenAI triage unavailable")
+
+    vitals_hint = (
+        "No recent vitals available."
+        if latest_vital is None
+        else (
+            f"Latest vitals: HR={latest_vital.heart_rate}, SpO2={latest_vital.spo2}, "
+            f"BP={latest_vital.bp_sys}/{latest_vital.bp_dia}, RR={latest_vital.respiratory_rate}, Temp={latest_vital.temperature}."
+        )
+    )
+    system_prompt = (
+        "You are a non-diagnostic health triage assistant for remote monitoring. "
+        "Return ONLY JSON with keys risk_level and reply. "
+        "risk_level must be one of LOW, MEDIUM, CRITICAL. "
+        "reply should be concise, safe, and advisory; never definitive diagnosis."
+    )
+    user_prompt = f"User message: {message}\n{vitals_hint}"
+
+    response = openai_client.responses.create(
+        model=OPENAI_CHATBOT_MODEL,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_output_tokens=220,
+    )
+    content = (response.output_text or "").strip()
+    parsed = json.loads(content)
+    risk_level = str(parsed.get("risk_level", "")).upper()
+    reply = str(parsed.get("reply", "")).strip()
+    if risk_level not in {"LOW", "MEDIUM", "CRITICAL"} or not reply:
+        raise ValueError("Invalid triage JSON from OpenAI")
+    return risk_level, reply
+
+
 def handle_alert_created_event(payload: dict):
-    alert_id = payload.get("alert_id")
+    event_type, event_data = parse_event_envelope(payload)
+    if event_type == "RISK_PREDICTED":
+        handle_risk_predicted_event(event_data)
+        return
+    if event_type is not None and event_type != "ALERT_CREATED":
+        logger.warning("Ignoring unsupported event_type on notifications queue: %s", event_type)
+        return
+    alert_id = event_data.get("alert_id")
     if not alert_id:
+        logger.warning("Dropping alert event without alert_id")
         return
     ws_event_payload: dict | None = None
     with Session(engine) as db:
@@ -148,6 +243,58 @@ def handle_alert_created_event(payload: dict):
                 logger.warning("WebSocket broadcast failed after alert processing: %s", exc)
 
         fut.add_done_callback(_log_future_exception)
+
+
+def handle_risk_predicted_event(payload: dict):
+    patient_id = payload.get("patient_id")
+    severity = str(payload.get("combined_severity", "")).upper()
+    if patient_id is None or severity not in {"HIGH", "CRITICAL"}:
+        return
+    ws_event_payload: dict | None = None
+    with Session(engine) as db:
+        # Basic deduplication for repeated prediction events in short windows.
+        recent_open = db.scalar(
+            select(Alert)
+            .where(
+                Alert.patient_id == int(patient_id),
+                Alert.rule_code == "RISK_PREDICTED",
+                Alert.status == AlertStatus.OPEN.value,
+            )
+            .order_by(Alert.created_at.desc())
+            .limit(1)
+        )
+        if recent_open is not None:
+            return
+        alert = Alert(
+            patient_id=int(patient_id),
+            severity=severity,
+            rule_code="RISK_PREDICTED",
+            message=(
+                f"Prediction severity={severity}, "
+                f"EWS={payload.get('ews_score')}, baseline_z={payload.get('baseline_max_z')}"
+            ),
+            status=AlertStatus.OPEN.value,
+        )
+        db.add(alert)
+        db.flush()
+        notify_doctors_or_capture_failure(db, alert)
+        ws_event_payload = serialize_alert_event(alert)
+        create_audit_log(
+            db,
+            actor_username="prediction-consumer",
+            action="PREDICTION_ALERT_CREATED",
+            target_type="ALERT",
+            target_id=str(alert.id),
+            metadata={
+                "patient_id": int(patient_id),
+                "combined_severity": severity,
+                "strategy_versions": payload.get("strategy_versions"),
+            },
+        )
+        db.commit()
+    if main_loop is not None and ws_event_payload is not None:
+        fut = asyncio.run_coroutine_threadsafe(manager.broadcast(ws_event_payload), main_loop)
+        fut.add_done_callback(lambda done_fut: done_fut.exception())
 
 
 @app.get("/v1/doctor/dashboard", response_model=DashboardResponse)
@@ -188,6 +335,7 @@ def patient_vitals_series(
             "spo2": r.spo2,
             "bp_sys": r.bp_sys,
             "bp_dia": r.bp_dia,
+            "respiratory_rate": r.respiratory_rate,
             "temperature": r.temperature,
             "source": r.source,
         }
@@ -229,6 +377,130 @@ def patient_stats(
     return PatientStatsResponse(patient_id=patient_id, window_minutes=window_minutes, summary=summary)
 
 
+@app.get("/v1/patients/{patient_id}/predictions")
+def patient_predictions(
+    patient_id: int,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.PATIENT, UserRole.CAREGIVER)),
+):
+    if not _can_access_patient(db, current_user, patient_id):
+        raise HTTPException(status_code=403, detail="No access to requested patient")
+    safe_limit = max(1, min(limit, 300))
+    rows = db.scalars(
+        select(PredictionRecord)
+        .where(PredictionRecord.patient_id == patient_id)
+        .order_by(PredictionRecord.predicted_at.desc())
+        .limit(safe_limit)
+    ).all()
+    return [
+        {
+            "id": p.id,
+            "patient_id": p.patient_id,
+            "reading_id": p.reading_id,
+            "ews_score": p.ews_score,
+            "ews_severity": p.ews_severity,
+            "baseline_max_z": p.baseline_max_z,
+            "baseline_severity": p.baseline_severity,
+            "combined_severity": p.combined_severity,
+            "strategy_versions": p.strategy_versions,
+            "factors": p.factors,
+            "predicted_at": p.predicted_at.isoformat(),
+        }
+        for p in rows
+    ]
+
+
+@app.get("/v1/notifications")
+def list_notifications(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.PATIENT, UserRole.CAREGIVER)),
+):
+    safe_limit = max(1, min(limit, 300))
+    base_query = select(Notification).order_by(Notification.created_at.desc()).limit(safe_limit)
+
+    if current_user.role == UserRole.DOCTOR.value:
+        rows = db.scalars(base_query.where(Notification.recipient == current_user.username)).all()
+    elif current_user.role == UserRole.ADMIN.value:
+        rows = db.scalars(base_query).all()
+    else:
+        # For patient/caregiver, map through accessible patient alerts.
+        if current_user.role == UserRole.PATIENT.value:
+            patient = db.scalar(select(Patient).where(Patient.user_id == current_user.id))
+            patient_ids = [patient.id] if patient else []
+        else:
+            assignments = db.scalars(
+                select(CaregiverAssignment).where(CaregiverAssignment.caregiver_user_id == current_user.id)
+            ).all()
+            patient_ids = [a.patient_id for a in assignments]
+
+        if not patient_ids:
+            return []
+        alert_ids = db.scalars(select(Alert.id).where(Alert.patient_id.in_(patient_ids))).all()
+        if not alert_ids:
+            return []
+        rows = db.scalars(base_query.where(Notification.alert_id.in_(alert_ids))).all()
+
+    return [
+        {
+            "id": n.id,
+            "alert_id": n.alert_id,
+            "channel": n.channel,
+            "recipient": n.recipient,
+            "status": n.status,
+            "details": n.details,
+            "created_at": n.created_at.isoformat(),
+        }
+        for n in rows
+    ]
+
+
+@app.post("/v1/chatbot/message", response_model=ChatbotMessageResponse)
+async def chatbot_message(
+    payload: ChatbotMessageRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.PATIENT, UserRole.CAREGIVER)),
+):
+    risk_level = "LOW"
+    escalated = False
+    alert_id: int | None = None
+    reply = ""
+
+    if payload.patient_id is not None and not _can_access_patient(db, current_user, payload.patient_id):
+        raise HTTPException(status_code=403, detail="No access to requested patient")
+
+    latest_vital = None
+    if payload.patient_id is not None:
+        latest_vital = db.scalar(
+            select(VitalReading)
+            .where(VitalReading.patient_id == payload.patient_id)
+            .order_by(VitalReading.ts.desc())
+            .limit(1)
+        )
+    try:
+        risk_level, reply = _chatbot_triage_openai(payload.message, latest_vital)
+    except Exception as exc:
+        logger.warning("OpenAI triage failed, using local fallback: %s", exc)
+        risk_level, reply = _chatbot_triage(payload.message)
+
+    if latest_vital is not None and (latest_vital.spo2 < 90 or latest_vital.heart_rate > 130):
+        risk_level = "CRITICAL"
+        reply = "Latest vitals are concerning (low oxygen or very high heart rate). Please contact emergency services and your doctor immediately."
+
+    create_audit_log(
+        db,
+        actor_username=current_user.username,
+        action="CHATBOT_MESSAGE",
+        target_type="PATIENT" if payload.patient_id is not None else "CHATBOT",
+        target_id=str(payload.patient_id) if payload.patient_id is not None else "N/A",
+        metadata={"risk_level": risk_level, "advisory_only": True},
+    )
+    db.commit()
+
+    return ChatbotMessageResponse(reply=reply, risk_level=risk_level, escalated=escalated, alert_id=alert_id)
+
+
 @app.get("/v1/patient/portal", response_model=PatientPortalResponse)
 def patient_portal(
     db: Session = Depends(get_db), current_user: User = Depends(require_roles(UserRole.PATIENT))
@@ -252,6 +524,7 @@ def patient_portal(
             "spo2": v.spo2,
             "bp_sys": v.bp_sys,
             "bp_dia": v.bp_dia,
+            "respiratory_rate": v.respiratory_rate,
             "temperature": v.temperature,
             "source": v.source,
         }
@@ -510,7 +783,9 @@ def reject_caregiver_request(
 
 
 @app.get("/v1/admin/patients")
-def list_patients(db: Session = Depends(get_db), _: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR))):
+def list_patients(
+    db: Session = Depends(get_db), _: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.SIMULATOR))
+):
     rows = db.scalars(select(Patient).order_by(Patient.id.asc()).limit(500)).all()
     return [{"id": p.id, "full_name": p.full_name, "user_id": p.user_id} for p in rows]
 
@@ -530,18 +805,19 @@ def list_audit(db: Session = Depends(get_db), _: User = Depends(require_roles(Us
     return [dict(r) for r in rows]
 
 
-@app.get("/v1/queue/health")
-def queue_health(_: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR))):
+def _probe_queue_health() -> dict:
     rabbit_url = os.getenv("RABBITMQ_URL", "")
-    queue_name = os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created")
+    queue_name = os.getenv("RABBITMQ_NOTIFICATION_QUEUE", os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created"))
+    dlq_name = f"{queue_name}.dlq"
     if not rabbit_url:
-        return {"connected": False, "configured": False, "queue": queue_name}
+        return {"connected": False, "configured": False, "queue": queue_name, "dlq": dlq_name}
 
     try:
         conn = pika.BlockingConnection(pika.URLParameters(rabbit_url))
         ch = conn.channel()
-        # Ensure queue exists; avoids false negatives on fresh startup.
-        result = ch.queue_declare(queue=queue_name, durable=True)
+        # Passive declarations avoid mutating queue arguments and precondition conflicts.
+        result = ch.queue_declare(queue=queue_name, passive=True)
+        dlq_result = ch.queue_declare(queue=dlq_name, passive=True)
         conn.close()
         return {
             "connected": True,
@@ -549,6 +825,8 @@ def queue_health(_: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR
             "queue": queue_name,
             "messages": result.method.message_count,
             "consumers": result.method.consumer_count,
+            "dlq": dlq_name,
+            "dlq_messages": dlq_result.method.message_count,
         }
     except Exception as exc:
         return {
@@ -557,6 +835,94 @@ def queue_health(_: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR
             "queue": queue_name,
             "error": str(exc),
         }
+
+
+@app.get("/v1/queue/health")
+def queue_health(_: User = Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR))):
+    return _probe_queue_health()
+
+
+@app.get("/v1/health")
+def service_health():
+    return {"status": "ok", "service": "notification"}
+
+
+@app.get("/v1/system/metrics", response_model=SystemMetricsResponse)
+def system_metrics(
+    db: Session = Depends(get_db), _: User = Depends(require_roles(UserRole.ADMIN, UserRole.SIMULATOR))
+):
+    now = datetime.now(timezone.utc)
+    one_minute_ago = now.timestamp() - 60
+    fifteen_minutes_ago = now.timestamp() - (15 * 60)
+    one_hour_ago = now.timestamp() - (60 * 60)
+
+    ingestion_last_minute = db.scalar(
+        select(func.count(VitalReading.id)).where(func.extract("epoch", VitalReading.ts) >= one_minute_ago)
+    ) or 0
+    active_patients_15m = db.scalar(
+        select(func.count(func.distinct(VitalReading.patient_id))).where(
+            func.extract("epoch", VitalReading.ts) >= fifteen_minutes_ago
+        )
+    ) or 0
+
+    open_alerts = db.scalar(select(func.count(Alert.id)).where(Alert.status == AlertStatus.OPEN.value)) or 0
+    total_alerts = db.scalar(select(func.count(Alert.id))) or 0
+
+    outbox_pending = db.scalar(
+        select(func.count(OutboxEvent.id)).where(OutboxEvent.status == OutboxStatus.PENDING.value)
+    ) or 0
+    outbox_failed = db.scalar(
+        select(func.count(OutboxEvent.id)).where(OutboxEvent.status == OutboxStatus.FAILED.value)
+    ) or 0
+    outbox_published = db.scalar(
+        select(func.count(OutboxEvent.id)).where(OutboxEvent.status == OutboxStatus.PUBLISHED.value)
+    ) or 0
+
+    failed_pending = db.scalar(
+        select(func.count(FailedEvent.id)).where(FailedEvent.status == FailedEventStatus.PENDING.value)
+    ) or 0
+    failed_exhausted = db.scalar(
+        select(func.count(FailedEvent.id)).where(FailedEvent.status == FailedEventStatus.EXHAUSTED.value)
+    ) or 0
+
+    latency_row = db.execute(
+        text(
+            """
+            SELECT
+              percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (published_at - created_at))) AS median_s,
+              percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (published_at - created_at))) AS p95_s
+            FROM outbox_events
+            WHERE published_at IS NOT NULL
+              AND EXTRACT(EPOCH FROM created_at) >= :cutoff
+            """
+        ),
+        {"cutoff": one_hour_ago},
+    ).mappings().first()
+
+    queue_status = _probe_queue_health()
+
+    return SystemMetricsResponse(
+        generated_at=now,
+        ingestion={
+            "readings_last_minute": int(ingestion_last_minute),
+            "readings_per_second_last_minute": round(float(ingestion_last_minute) / 60.0, 3),
+            "active_patients_last_15m": int(active_patients_15m),
+        },
+        alerts={"open": int(open_alerts), "total": int(total_alerts)},
+        outbox={
+            "pending": int(outbox_pending),
+            "failed": int(outbox_failed),
+            "published": int(outbox_published),
+            "publish_latency_median_s_last_hour": round(float(latency_row["median_s"]), 3)
+            if latency_row and latency_row["median_s"] is not None
+            else None,
+            "publish_latency_p95_s_last_hour": round(float(latency_row["p95_s"]), 3)
+            if latency_row and latency_row["p95_s"] is not None
+            else None,
+        },
+        failed_events={"pending": int(failed_pending), "exhausted": int(failed_exhausted)},
+        queue=queue_status,
+    )
 
 
 @app.websocket("/ws/doctor")

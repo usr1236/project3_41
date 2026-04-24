@@ -9,6 +9,7 @@ class VitalIngestRequest(BaseModel):
     spo2: float = Field(ge=50, le=100)
     bp_sys: int = Field(ge=50, le=260)
     bp_dia: int = Field(ge=30, le=160)
+    respiratory_rate: int = Field(default=16, ge=4, le=60)
     temperature: float = Field(ge=30, le=45)
     source: str = "simulator"
 
@@ -95,6 +96,27 @@ class PatientStatsResponse(BaseModel):
     patient_id: int
     window_minutes: int
     summary: dict
+
+
+class SystemMetricsResponse(BaseModel):
+    generated_at: datetime
+    ingestion: dict
+    alerts: dict
+    outbox: dict
+    failed_events: dict
+    queue: dict
+
+
+class ChatbotMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+    patient_id: int | None = None
+
+
+class ChatbotMessageResponse(BaseModel):
+    reply: str
+    risk_level: str
+    escalated: bool
+    alert_id: int | None = None
 
 
 class PatientPortalResponse(BaseModel):

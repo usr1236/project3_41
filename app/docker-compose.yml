@@ -9,6 +9,10 @@ services:
         condition: service_started
       notification:
         condition: service_started
+      prediction:
+        condition: service_started
+      escalation:
+        condition: service_started
     ports:
       - "8000:80"
     volumes:
@@ -60,6 +64,11 @@ services:
       JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
       RABBITMQ_ALERT_QUEUE: vitaltrack.alerts.created
+      RABBITMQ_NOTIFICATION_QUEUE: vitaltrack.notifications.events
+      RABBITMQ_VITAL_QUEUE: vitaltrack.vitals.received
+      RABBITMQ_ESCALATION_QUEUE: vitaltrack.escalation.events
+      RABBITMQ_DLX: vitaltrack.dlx
+      RABBITMQ_FORCE_DLX_REDECLARE: "true"
     command: ["uvicorn", "app.ingestion_main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   notification:
@@ -75,7 +84,52 @@ services:
       JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
       RABBITMQ_ALERT_QUEUE: vitaltrack.alerts.created
+      RABBITMQ_NOTIFICATION_QUEUE: vitaltrack.notifications.events
+      RABBITMQ_VITAL_QUEUE: vitaltrack.vitals.received
+      RABBITMQ_ESCALATION_QUEUE: vitaltrack.escalation.events
+      RABBITMQ_DLX: vitaltrack.dlx
+      RABBITMQ_FORCE_DLX_REDECLARE: "true"
+      OPENAI_CHATBOT_ENABLED: "true"
+      OPENAI_CHATBOT_MODEL: "gpt-4.1-mini"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     command: ["uvicorn", "app.notification_main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  prediction:
+    build: ./backend
+    container_name: vitaltrack-prediction
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://vitaltrack:vitaltrack@db:5432/vitaltrack
+      JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      RABBITMQ_NOTIFICATION_QUEUE: vitaltrack.notifications.events
+      RABBITMQ_VITAL_QUEUE: vitaltrack.vitals.received
+      RABBITMQ_ESCALATION_QUEUE: vitaltrack.escalation.events
+      RABBITMQ_DLX: vitaltrack.dlx
+      RABBITMQ_FORCE_DLX_REDECLARE: "true"
+    command: ["uvicorn", "app.prediction_main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  escalation:
+    build: ./backend
+    container_name: vitaltrack-escalation
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://vitaltrack:vitaltrack@db:5432/vitaltrack
+      JWT_SECRET: "vitaltrack-s3cure-jwt-secret-2026-change-this-in-prod-32plus"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      RABBITMQ_ESCALATION_QUEUE: vitaltrack.escalation.events
+      RABBITMQ_DLX: vitaltrack.dlx
+      RABBITMQ_FORCE_DLX_REDECLARE: "true"
+      ESCALATION_INTERVAL_SECONDS: "120"
+    command: ["uvicorn", "app.escalation_main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:
   vitaltrack_data:

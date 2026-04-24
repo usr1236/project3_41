@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from .auth import authenticate_user, create_access_token, get_password_hash, require_roles
 from .db import Base, engine, get_db
-from .messaging import RabbitMQBridge
+from .messaging import RabbitMQBridge, build_event_envelope
 from .models import (
     Alert,
     AlertStatus,
@@ -38,12 +38,16 @@ from .services import calculate_risk_score, create_audit_log, evaluate_alert
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 logger = logging.getLogger("vitaltrack.ingestion")
 
-rabbit_bridge: RabbitMQBridge | None = None
+notification_bridge: RabbitMQBridge | None = None
+prediction_bridge: RabbitMQBridge | None = None
 outbox_stop_event = threading.Event()
 outbox_thread: threading.Thread | None = None
 
 
 def _publish_pending_outbox():
+    notification_queue = os.getenv("RABBITMQ_NOTIFICATION_QUEUE", os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created"))
+    prediction_queue = os.getenv("RABBITMQ_VITAL_QUEUE", "vitaltrack.vitals.received")
+    escalation_queue = os.getenv("RABBITMQ_ESCALATION_QUEUE", "vitaltrack.escalation.events")
     while not outbox_stop_event.is_set():
         with Session(engine) as db:
             rows = db.scalars(
@@ -58,12 +62,19 @@ def _publish_pending_outbox():
 
             for event in rows:
                 event.updated_at = datetime.now(timezone.utc)
-                if rabbit_bridge is None:
+                if notification_bridge is None or prediction_bridge is None:
                     event.status = OutboxStatus.FAILED.value
                     event.retry_count += 1
                     event.last_error = "RabbitMQ bridge unavailable"
                     continue
-                published = rabbit_bridge.publish_alert_created(event.payload)
+                if event.event_type == "VITAL_RECEIVED":
+                    published = prediction_bridge.publish_event(event.payload, queue_name=prediction_queue)
+                elif event.event_type == "ALERT_CREATED_NOTIFICATION":
+                    published = notification_bridge.publish_event(event.payload, queue_name=notification_queue)
+                elif event.event_type == "ALERT_CREATED_ESCALATION":
+                    published = notification_bridge.publish_event(event.payload, queue_name=escalation_queue)
+                else:
+                    published = notification_bridge.publish_event(event.payload, queue_name=notification_queue)
                 if published:
                     event.status = OutboxStatus.PUBLISHED.value
                     event.last_error = None
@@ -95,15 +106,19 @@ def stop_outbox_worker():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global rabbit_bridge
+    global notification_bridge, prediction_bridge
     Base.metadata.create_all(bind=engine)
     migrate_audit_metadata_to_jsonb()
+    migrate_vital_columns()
     seed_basics()
     init_timescale()
     rabbit_url = os.getenv("RABBITMQ_URL", "")
-    rabbit_queue = os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created")
+    rabbit_queue = os.getenv("RABBITMQ_NOTIFICATION_QUEUE", os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created"))
     if rabbit_url:
-        rabbit_bridge = RabbitMQBridge(rabbit_url, rabbit_queue, lambda _: None)
+        notification_bridge = RabbitMQBridge(rabbit_url, rabbit_queue, lambda _: None)
+        prediction_bridge = RabbitMQBridge(
+            rabbit_url, os.getenv("RABBITMQ_VITAL_QUEUE", "vitaltrack.vitals.received"), lambda _: None
+        )
     start_outbox_worker()
     yield
     stop_outbox_worker()
@@ -203,6 +218,7 @@ def ingest_vitals(
         spo2=payload.spo2,
         bp_sys=payload.bp_sys,
         bp_dia=payload.bp_dia,
+        respiratory_rate=payload.respiratory_rate,
         temperature=payload.temperature,
         source=payload.source,
     )
@@ -243,14 +259,48 @@ def ingest_vitals(
         target_id=str(payload.patient_id),
         metadata={"reading_id": reading.id, "risk_score": risk_score},
     )
-    db.commit()
-
-    # Transactional outbox: enqueue alert event in the same DB transaction.
+    # Transactional outbox: enqueue events in same commit as domain writes.
+    db.add(
+        OutboxEvent(
+            event_type="VITAL_RECEIVED",
+            payload=build_event_envelope(
+                "VITAL_RECEIVED",
+                {
+                    "reading_id": reading.id,
+                    "patient_id": payload.patient_id,
+                    "heart_rate": payload.heart_rate,
+                    "spo2": payload.spo2,
+                    "bp_sys": payload.bp_sys,
+                    "bp_dia": payload.bp_dia,
+                    "respiratory_rate": payload.respiratory_rate,
+                    "temperature": payload.temperature,
+                    "source": payload.source,
+                    "risk_score": risk_score,
+                },
+            ),
+            status=OutboxStatus.PENDING.value,
+        )
+    )
+    create_audit_log(
+        db,
+        actor_username=user.username,
+        action="VITAL_EVENT_ENQUEUED",
+        target_type="OUTBOX",
+        target_id=str(reading.id),
+        metadata={"event_type": "VITAL_RECEIVED"},
+    )
     if alert_created and alert is not None:
         db.add(
             OutboxEvent(
-                event_type="ALERT_CREATED",
-                payload={"alert_id": alert_id},
+                event_type="ALERT_CREATED_NOTIFICATION",
+                payload=build_event_envelope("ALERT_CREATED", {"alert_id": alert_id}),
+                status=OutboxStatus.PENDING.value,
+            )
+        )
+        db.add(
+            OutboxEvent(
+                event_type="ALERT_CREATED_ESCALATION",
+                payload=build_event_envelope("ALERT_CREATED", {"alert_id": alert_id}),
                 status=OutboxStatus.PENDING.value,
             )
         )
@@ -260,9 +310,9 @@ def ingest_vitals(
             action="ALERT_EVENT_ENQUEUED",
             target_type="OUTBOX",
             target_id=str(alert_id),
-            metadata={"event_type": "ALERT_CREATED"},
+            metadata={"event_type": "ALERT_CREATED", "targets": ["NOTIFICATION", "ESCALATION"]},
         )
-        db.commit()
+    db.commit()
 
     return VitalIngestResponse(
         reading_id=reading.id,
@@ -315,6 +365,18 @@ def migrate_audit_metadata_to_jsonb():
                         USING audit_metadata::jsonb;
                     END IF;
                 END $$;
+                """
+            )
+        )
+
+
+def migrate_vital_columns():
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE vital_readings
+                ADD COLUMN IF NOT EXISTS respiratory_rate INTEGER NOT NULL DEFAULT 16;
                 """
             )
         )

@@ -119,6 +119,7 @@ class VitalReading(Base):
     spo2: Mapped[float] = mapped_column(Float, nullable=False)
     bp_sys: Mapped[int] = mapped_column(Integer, nullable=False)
     bp_dia: Mapped[int] = mapped_column(Integer, nullable=False)
+    respiratory_rate: Mapped[int] = mapped_column(Integer, default=16, nullable=False)
     temperature: Mapped[float] = mapped_column(Float, nullable=False)
     source: Mapped[str] = mapped_column(String(50), default="simulator", nullable=False)
 
@@ -186,3 +187,44 @@ class OutboxEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PredictionBaseline(Base):
+    __tablename__ = "prediction_baselines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
+    vital_name: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    mean: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    m2: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class PredictionRecord(Base):
+    __tablename__ = "prediction_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
+    reading_id: Mapped[int | None] = mapped_column(ForeignKey("vital_readings.id"), nullable=True, index=True)
+    ews_score: Mapped[float] = mapped_column(Float, nullable=False)
+    ews_severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    baseline_max_z: Mapped[float] = mapped_column(Float, nullable=False)
+    baseline_severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    combined_severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    strategy_versions: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    factors: Mapped[list] = mapped_column(JSONB, nullable=False)
+    predicted_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+
+
+class EscalationCase(Base):
+    __tablename__ = "escalation_cases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    alert_id: Mapped[int] = mapped_column(ForeignKey("alerts.id"), nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(30), default="ACTIVE", nullable=False, index=True)
+    step_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    last_recipient_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
