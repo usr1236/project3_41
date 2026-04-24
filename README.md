@@ -1,11 +1,17 @@
 # VitalTrack Project 3 Task 4 Prototype
 
-This folder contains a full working prototype for **two end-to-end workflows** deployed as **microservices**:
+This folder contains a full working prototype for **five end-to-end workflows** deployed as **microservices**:
 
 1. **E2E-1 Critical Alert Pipeline**  
    `Gateway -> Ingestion Service -> Risk/Rule Evaluation -> Alert Creation -> RabbitMQ Publish -> Notification Service Consumer -> Realtime Dashboard Event -> Audit Log`
 2. **E2E-2 Clinical Acknowledgment Pipeline**  
    `Doctor Acknowledges Alert -> Alert Status Update -> Realtime Dashboard Event -> Audit Log`
+3. **E2E-3 Critical Escalation Pipeline**  
+   `Critical Alert Unacknowledged -> Escalation Mediator Timed Step -> Escalation Notification -> Audit Log`
+4. **E2E-4 Caregiver Approval & Access Pipeline**  
+   `Caregiver Signup Request -> Admin Approval -> Scoped Caregiver Dashboard Access`
+5. **E2E-5 Chatbot Advisory Pipeline**  
+   `User Chat Message -> Strategy/Provider Triage (OpenAI/Gemini/Local) -> Advisory Response -> Audit Log`
 
 ## Stack
 
@@ -261,7 +267,7 @@ The repository now includes a root `tests/` directory with:
   - risk scoring and alert evaluation (`tests/unit/test_services_unit.py`)
   - access-scope enforcement (`tests/unit/test_access_scope_unit.py`)
   - prediction strategy severity logic (`tests/unit/test_prediction_unit.py`)
-- Integration tests for implemented E2E flows:
+- Integration tests for core E2E pipelines:
   - critical alert pipeline (`tests/integration/test_e2e_critical_alert_pipeline.py`)
   - clinical acknowledgment pipeline (`tests/integration/test_e2e_acknowledgment_pipeline.py`)
 
@@ -354,7 +360,7 @@ Then hard refresh browser (`Ctrl+Shift+R`) and click `Reconnect WebSocket` in th
 - Prototype deployment style: **microservices with gateway + broker**
 - Frontend deployment style: **separate containerized React app**
 - Database: **shared TimescaleDB-backed PostgreSQL (prototype compromise)**
-- Non-trivial implemented E2E count: **2**
+- Non-trivial implemented E2E count: **5**
 - Failed-event handling is implemented via `failed_events` table and retry workflow.
 - Transactional outbox is implemented for alert event delivery. The ingestion service writes `alerts` and `outbox_events` in one transaction, and a background outbox publisher retries broker publish until events transition to `PUBLISHED`.
 - Broker messages now use a versioned event envelope (`schema_version`, `event_type`, `occurred_at`, `data`) for producer/consumer compatibility and independent evolution.
