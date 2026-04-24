@@ -384,22 +384,56 @@ def migrate_vital_columns():
 
 def seed_basics():
     with Session(engine) as db:
-        existing = db.scalar(select(User).where(User.username == "admin"))
-        if existing:
-            return
-
-        users = [
-            User(username="admin", password_hash=get_password_hash("admin123"), role=UserRole.ADMIN.value),
-            User(username="doctor1", password_hash=get_password_hash("doctor123"), role=UserRole.DOCTOR.value),
-            User(username="patient1", password_hash=get_password_hash("patient123"), role=UserRole.PATIENT.value),
-            User(username="caregiver1", password_hash=get_password_hash("care123"), role=UserRole.CAREGIVER.value),
-            User(username="simulator", password_hash=get_password_hash("sim123"), role=UserRole.SIMULATOR.value),
+        seed_users = [
+            ("admin", "admin123", UserRole.ADMIN.value),
+            ("doctor1", "doctor123", UserRole.DOCTOR.value),
+            ("doctor2", "doctor223", UserRole.DOCTOR.value),
+            ("patient1", "patient123", UserRole.PATIENT.value),
+            ("patient2", "patient223", UserRole.PATIENT.value),
+            ("caregiver1", "care123", UserRole.CAREGIVER.value),
+            ("caregiver2", "care223", UserRole.CAREGIVER.value),
+            ("caregiver3", "care323", UserRole.CAREGIVER.value),
+            ("caregiver4", "care423", UserRole.CAREGIVER.value),
+            ("simulator", "sim123", UserRole.SIMULATOR.value),
         ]
-        db.add_all(users)
-        db.flush()
 
-        patient = Patient(user_id=users[2].id, full_name="John Patient")
-        db.add(patient)
-        db.flush()
-        db.add(CaregiverAssignment(caregiver_user_id=users[3].id, patient_id=patient.id))
+        user_by_name: dict[str, User] = {}
+        for username, password, role in seed_users:
+            user = db.scalar(select(User).where(User.username == username))
+            if user is None:
+                user = User(username=username, password_hash=get_password_hash(password), role=role)
+                db.add(user)
+                db.flush()
+            user_by_name[username] = user
+
+        patient_specs = {
+            "patient1": "John Patient",
+            "patient2": "Jane Patient",
+        }
+        patient_by_username: dict[str, Patient] = {}
+        for patient_username, full_name in patient_specs.items():
+            patient_user = user_by_name[patient_username]
+            patient = db.scalar(select(Patient).where(Patient.user_id == patient_user.id))
+            if patient is None:
+                patient = Patient(user_id=patient_user.id, full_name=full_name)
+                db.add(patient)
+                db.flush()
+            patient_by_username[patient_username] = patient
+
+        caregiver_assignments = {
+            "patient1": ["caregiver1", "caregiver2"],
+            "patient2": ["caregiver3", "caregiver4"],
+        }
+        for patient_username, caregiver_usernames in caregiver_assignments.items():
+            patient = patient_by_username[patient_username]
+            for caregiver_username in caregiver_usernames:
+                caregiver_user = user_by_name[caregiver_username]
+                assignment = db.scalar(
+                    select(CaregiverAssignment).where(
+                        CaregiverAssignment.caregiver_user_id == caregiver_user.id,
+                        CaregiverAssignment.patient_id == patient.id,
+                    )
+                )
+                if assignment is None:
+                    db.add(CaregiverAssignment(caregiver_user_id=caregiver_user.id, patient_id=patient.id))
         db.commit()

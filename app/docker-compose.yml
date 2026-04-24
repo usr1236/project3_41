@@ -128,7 +128,7 @@ services:
       RABBITMQ_ESCALATION_QUEUE: vitaltrack.escalation.events
       RABBITMQ_DLX: vitaltrack.dlx
       RABBITMQ_FORCE_DLX_REDECLARE: "true"
-      ESCALATION_INTERVAL_SECONDS: "120"
+      ESCALATION_INTERVAL_SECONDS: "27"
     command: ["uvicorn", "app.escalation_main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:

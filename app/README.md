@@ -53,8 +53,13 @@ docker compose up --build -d notification
 
 - `admin / admin123`
 - `doctor1 / doctor123`
+- `doctor2 / doctor223`
 - `patient1 / patient123`
+- `patient2 / patient223`
 - `caregiver1 / care123`
+- `caregiver2 / care223`
+- `caregiver3 / care323`
+- `caregiver4 / care423`
 - `simulator / sim123`
 
 ## Use the Full App (Role Flows)
