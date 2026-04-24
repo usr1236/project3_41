@@ -92,6 +92,9 @@ services:
       OPENAI_CHATBOT_ENABLED: "true"
       OPENAI_CHATBOT_MODEL: "gpt-4.1-mini"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_CHATBOT_ENABLED: "true"
+      GEMINI_CHATBOT_MODEL: "gemini-2.0-flash"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     command: ["uvicorn", "app.notification_main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   prediction:

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VitalIngestRequest(BaseModel):
@@ -32,8 +32,7 @@ class AlertOut(BaseModel):
     ack_by: int | None
     ack_at: datetime | None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DashboardResponse(BaseModel):
@@ -115,6 +114,7 @@ class ChatbotMessageRequest(BaseModel):
 class ChatbotMessageResponse(BaseModel):
     reply: str
     risk_level: str
+    strategy_used: str | None = None
     escalated: bool
     alert_id: int | None = None
 

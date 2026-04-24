@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import time
+from typing import Protocol
+from urllib import request as urllib_request
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from openai import OpenAI
@@ -97,6 +99,8 @@ async def lifespan(_: FastAPI):
             openai_client = OpenAI(api_key=api_key)
         else:
             logger.warning("OpenAI chatbot is enabled by default but OPENAI_API_KEY is missing; using local fallback.")
+    if GEMINI_CHATBOT_ENABLED and not os.getenv("GEMINI_API_KEY"):
+        logger.warning("Gemini chatbot strategy is enabled but GEMINI_API_KEY is missing; strategy will be skipped.")
     rabbit_url = os.getenv("RABBITMQ_URL", "")
     rabbit_queue = os.getenv("RABBITMQ_NOTIFICATION_QUEUE", os.getenv("RABBITMQ_ALERT_QUEUE", "vitaltrack.alerts.created"))
     if rabbit_url:
@@ -111,6 +115,8 @@ app = FastAPI(title="VitalTrack Notification Service", lifespan=lifespan)
 logger = logging.getLogger("vitaltrack.notification")
 OPENAI_CHATBOT_ENABLED = os.getenv("OPENAI_CHATBOT_ENABLED", "true").lower() not in {"0", "false", "no"}
 OPENAI_CHATBOT_MODEL = os.getenv("OPENAI_CHATBOT_MODEL", "gpt-4.1-mini")
+GEMINI_CHATBOT_ENABLED = os.getenv("GEMINI_CHATBOT_ENABLED", "true").lower() not in {"0", "false", "no"}
+GEMINI_CHATBOT_MODEL = os.getenv("GEMINI_CHATBOT_MODEL", "gemini-2.0-flash")
 openai_client: OpenAI | None = None
 
 
@@ -159,10 +165,7 @@ def _chatbot_triage(message: str) -> tuple[str, str]:
     )
 
 
-def _chatbot_triage_openai(message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
-    if not OPENAI_CHATBOT_ENABLED or openai_client is None:
-        raise RuntimeError("OpenAI triage unavailable")
-
+def _build_vitals_hint(latest_vital: VitalReading | None) -> str:
     vitals_hint = (
         "No recent vitals available."
         if latest_vital is None
@@ -171,30 +174,122 @@ def _chatbot_triage_openai(message: str, latest_vital: VitalReading | None) -> t
             f"BP={latest_vital.bp_sys}/{latest_vital.bp_dia}, RR={latest_vital.respiratory_rate}, Temp={latest_vital.temperature}."
         )
     )
-    system_prompt = (
+    return vitals_hint
+
+
+def _build_triage_system_prompt() -> str:
+    return (
         "You are a non-diagnostic health triage assistant for remote monitoring. "
         "Return ONLY JSON with keys risk_level and reply. "
         "risk_level must be one of LOW, MEDIUM, CRITICAL. "
         "reply should be concise, safe, and advisory; never definitive diagnosis."
     )
-    user_prompt = f"User message: {message}\n{vitals_hint}"
 
-    response = openai_client.responses.create(
-        model=OPENAI_CHATBOT_MODEL,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-        max_output_tokens=220,
-    )
-    content = (response.output_text or "").strip()
-    parsed = json.loads(content)
-    risk_level = str(parsed.get("risk_level", "")).upper()
-    reply = str(parsed.get("reply", "")).strip()
-    if risk_level not in {"LOW", "MEDIUM", "CRITICAL"} or not reply:
-        raise ValueError("Invalid triage JSON from OpenAI")
-    return risk_level, reply
+
+class TriageResponseAdapter(Protocol):
+    def adapt(self, raw_text: str) -> tuple[str, str]:
+        ...
+
+
+class JsonTriageResponseAdapter:
+    def adapt(self, raw_text: str) -> tuple[str, str]:
+        parsed = json.loads(raw_text.strip())
+        risk_level = str(parsed.get("risk_level", "")).upper()
+        reply = str(parsed.get("reply", "")).strip()
+        if risk_level not in {"LOW", "MEDIUM", "CRITICAL"} or not reply:
+            raise ValueError("Invalid triage JSON payload")
+        return risk_level, reply
+
+
+class ChatbotTriageStrategy(Protocol):
+    name: str
+
+    def triage(self, message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
+        ...
+
+
+class OpenAITriageStrategy:
+    name = "openai"
+
+    def __init__(self, adapter: TriageResponseAdapter):
+        self.adapter = adapter
+
+    def triage(self, message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
+        if not OPENAI_CHATBOT_ENABLED or openai_client is None:
+            raise RuntimeError("OpenAI triage unavailable")
+        system_prompt = _build_triage_system_prompt()
+        user_prompt = f"User message: {message}\n{_build_vitals_hint(latest_vital)}"
+        response = openai_client.responses.create(
+            model=OPENAI_CHATBOT_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_output_tokens=220,
+        )
+        content = (response.output_text or "").strip()
+        return self.adapter.adapt(content)
+
+
+class GeminiTriageStrategy:
+    name = "gemini"
+
+    def __init__(self, adapter: TriageResponseAdapter):
+        self.adapter = adapter
+
+    def triage(self, message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
+        if not GEMINI_CHATBOT_ENABLED:
+            raise RuntimeError("Gemini triage disabled")
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Gemini triage unavailable")
+        system_prompt = _build_triage_system_prompt()
+        user_prompt = f"User message: {message}\n{_build_vitals_hint(latest_vital)}"
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHATBOT_MODEL}:generateContent"
+            f"?key={api_key}"
+        )
+        body = {
+            "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 220},
+        }
+        req = urllib_request.Request(
+            endpoint,
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib_request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        text_parts = payload["candidates"][0]["content"]["parts"]
+        raw_text = " ".join(str(part.get("text", "")) for part in text_parts).strip()
+        if not raw_text:
+            raise ValueError("Gemini returned empty response")
+        return self.adapter.adapt(raw_text)
+
+
+class LocalRulesTriageStrategy:
+    name = "local_rules"
+
+    def triage(self, message: str, latest_vital: VitalReading | None) -> tuple[str, str]:
+        del latest_vital
+        return _chatbot_triage(message)
+
+
+class ChatbotTriageFactory:
+    @staticmethod
+    def create_response_adapter() -> TriageResponseAdapter:
+        return JsonTriageResponseAdapter()
+
+    @staticmethod
+    def create_strategies() -> list[ChatbotTriageStrategy]:
+        adapter = ChatbotTriageFactory.create_response_adapter()
+        return [
+            OpenAITriageStrategy(adapter),
+            GeminiTriageStrategy(adapter),
+            LocalRulesTriageStrategy(),
+        ]
 
 
 def handle_alert_created_event(payload: dict):
@@ -466,6 +561,7 @@ async def chatbot_message(
     escalated = False
     alert_id: int | None = None
     reply = ""
+    strategy_used = "none"
 
     if payload.patient_id is not None and not _can_access_patient(db, current_user, payload.patient_id):
         raise HTTPException(status_code=403, detail="No access to requested patient")
@@ -478,11 +574,13 @@ async def chatbot_message(
             .order_by(VitalReading.ts.desc())
             .limit(1)
         )
-    try:
-        risk_level, reply = _chatbot_triage_openai(payload.message, latest_vital)
-    except Exception as exc:
-        logger.warning("OpenAI triage failed, using local fallback: %s", exc)
-        risk_level, reply = _chatbot_triage(payload.message)
+    for strategy in ChatbotTriageFactory.create_strategies():
+        try:
+            risk_level, reply = strategy.triage(payload.message, latest_vital)
+            strategy_used = strategy.name
+            break
+        except Exception as exc:
+            logger.warning("%s triage failed, trying next strategy: %s", strategy.name, exc)
 
     if latest_vital is not None and (latest_vital.spo2 < 90 or latest_vital.heart_rate > 130):
         risk_level = "CRITICAL"
@@ -494,11 +592,17 @@ async def chatbot_message(
         action="CHATBOT_MESSAGE",
         target_type="PATIENT" if payload.patient_id is not None else "CHATBOT",
         target_id=str(payload.patient_id) if payload.patient_id is not None else "N/A",
-        metadata={"risk_level": risk_level, "advisory_only": True},
+        metadata={"risk_level": risk_level, "advisory_only": True, "triage_strategy": strategy_used},
     )
     db.commit()
 
-    return ChatbotMessageResponse(reply=reply, risk_level=risk_level, escalated=escalated, alert_id=alert_id)
+    return ChatbotMessageResponse(
+        reply=reply,
+        risk_level=risk_level,
+        strategy_used=strategy_used,
+        escalated=escalated,
+        alert_id=alert_id,
+    )
 
 
 @app.get("/v1/patient/portal", response_model=PatientPortalResponse)

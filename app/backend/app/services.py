@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import random
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,6 +22,106 @@ from .models import (
 )
 
 
+AlertDecision = tuple[bool, AlertSeverity | None, str, str]
+
+
+class AlertRuleHandler:
+    """Chain of Responsibility for alert rule evaluation."""
+
+    def __init__(self):
+        self._next: AlertRuleHandler | None = None
+
+    def set_next(self, nxt: AlertRuleHandler) -> AlertRuleHandler:
+        self._next = nxt
+        return nxt
+
+    def handle(self, reading: VitalReading, risk_score: float) -> AlertDecision:
+        decision = self._evaluate(reading, risk_score)
+        if decision is not None:
+            return decision
+        if self._next is not None:
+            return self._next.handle(reading, risk_score)
+        return False, None, "NORMAL", "No alert"
+
+    def _evaluate(self, reading: VitalReading, risk_score: float) -> AlertDecision | None:
+        raise NotImplementedError
+
+
+class CriticalVitalsRule(AlertRuleHandler):
+    def _evaluate(self, reading: VitalReading, risk_score: float) -> AlertDecision | None:
+        del risk_score
+        if reading.spo2 < 88 or reading.heart_rate > 130:
+            return True, AlertSeverity.CRITICAL, "CRIT_VITALS", "Critical vital signs detected"
+        return None
+
+
+class HighRiskScoreRule(AlertRuleHandler):
+    def _evaluate(self, reading: VitalReading, risk_score: float) -> AlertDecision | None:
+        del reading
+        if risk_score >= 20:
+            return True, AlertSeverity.HIGH, "HIGH_RISK_SCORE", "High short-term risk predicted"
+        return None
+
+
+class AbnormalTrendRule(AlertRuleHandler):
+    def _evaluate(self, reading: VitalReading, risk_score: float) -> AlertDecision | None:
+        del risk_score
+        if reading.spo2 < 92 or reading.temperature > 38.5:
+            return True, AlertSeverity.MEDIUM, "ABNORMAL_TREND", "Abnormal trend detected"
+        return None
+
+
+class NotificationCommand(Protocol):
+    """Command interface for notification dispatch actions."""
+
+    def execute(self) -> tuple[bool, str]:
+        ...
+
+
+class InAppNotificationCommand:
+    def __init__(self, db: Session, alert: Alert, recipient: str):
+        self.db = db
+        self.alert = alert
+        self.recipient = recipient
+
+    def execute(self) -> tuple[bool, str]:
+        # Simulate occasional channel failures for failed-event handling demonstration.
+        # Set recipient to include "fail" for deterministic failure.
+        fails = "fail" in self.recipient or random.random() < 0.1
+        if fails:
+            return False, "Notification provider timeout"
+
+        self.db.add(
+            Notification(
+                alert_id=self.alert.id,
+                channel="in_app",
+                recipient=self.recipient,
+                status="SENT",
+                details=f"Alert {self.alert.id} ({self.alert.severity}): {self.alert.message}",
+            )
+        )
+        return True, "sent"
+
+
+class NotificationCommandFactory:
+    """Factory method for constructing concrete notification commands."""
+
+    @staticmethod
+    def create(channel: str, db: Session, alert: Alert, recipient: str) -> NotificationCommand:
+        if channel == "in_app":
+            return InAppNotificationCommand(db, alert, recipient)
+        raise ValueError(f"Unsupported notification channel: {channel}")
+
+
+def _build_alert_rule_chain() -> AlertRuleHandler:
+    root = CriticalVitalsRule()
+    root.set_next(HighRiskScoreRule()).set_next(AbnormalTrendRule())
+    return root
+
+
+_ALERT_RULE_CHAIN = _build_alert_rule_chain()
+
+
 def calculate_risk_score(reading: VitalReading) -> float:
     score = 0.0
     if reading.spo2 < 92:
@@ -35,13 +136,7 @@ def calculate_risk_score(reading: VitalReading) -> float:
 
 
 def evaluate_alert(reading: VitalReading, risk_score: float) -> tuple[bool, AlertSeverity | None, str, str]:
-    if reading.spo2 < 88 or reading.heart_rate > 130:
-        return True, AlertSeverity.CRITICAL, "CRIT_VITALS", "Critical vital signs detected"
-    if risk_score >= 20:
-        return True, AlertSeverity.HIGH, "HIGH_RISK_SCORE", "High short-term risk predicted"
-    if reading.spo2 < 92 or reading.temperature > 38.5:
-        return True, AlertSeverity.MEDIUM, "ABNORMAL_TREND", "Abnormal trend detected"
-    return False, None, "NORMAL", "No alert"
+    return _ALERT_RULE_CHAIN.handle(reading, risk_score)
 
 
 def create_audit_log(
@@ -59,22 +154,8 @@ def create_audit_log(
 
 
 def _dispatch_notification(db: Session, alert: Alert, recipient: str) -> tuple[bool, str]:
-    # Simulate occasional channel failures for failed-event handling demonstration.
-    # Set recipient to include "fail" for deterministic failure.
-    fails = "fail" in recipient or random.random() < 0.1
-    if fails:
-        return False, "Notification provider timeout"
-
-    db.add(
-        Notification(
-            alert_id=alert.id,
-            channel="in_app",
-            recipient=recipient,
-            status="SENT",
-            details=f"Alert {alert.id} ({alert.severity}): {alert.message}",
-        )
-    )
-    return True, "sent"
+    command = NotificationCommandFactory.create("in_app", db, alert, recipient)
+    return command.execute()
 
 
 def notify_doctors_or_capture_failure(db: Session, alert: Alert):

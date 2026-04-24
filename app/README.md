@@ -43,6 +43,14 @@ docker compose down
 docker compose up -d
 ```
 
+If websocket or routed endpoints look stale after restart:
+
+```bash
+docker compose restart notification gateway
+sleep 2
+docker compose ps
+```
+
 Rebuild a single changed service:
 
 ```bash
@@ -79,10 +87,14 @@ docker compose up --build -d notification
 - Login as `doctor1`.
 - Open Doctor dashboard.
 - Observe:
-  - incoming websocket events
-  - active alerts
+  - websocket status badge (`connecting` -> `connected`) with auto-reconnect support
+  - incoming realtime events
+  - active alerts table
   - patient vitals and predictions
-- Acknowledge alerts from the dashboard/API.
+- Acknowledge alerts directly from **Doctor Monitoring Hub -> Open Alerts (Acknowledge)** table or via API.
+- Use **Reconnect WebSocket** button in top bar if status is not `connected`.
+- Use **Close Alerts / Open Alerts** to hide/show alerts panel.
+- Use **Load AI Predictions** to populate prediction table.
 
 ### 3) Patient
 
@@ -102,7 +114,11 @@ docker compose up --build -d notification
 
 - Login as `admin`.
 - Manage users and caregiver approvals.
-- Review notifications panel and audit trail.
+- Use **Admin Operations Center** controls:
+  - load notifications
+  - load queue health (including DLQ depth)
+  - load audit trail
+  - trigger failed-event retries
 - View runtime system metrics (NFR-oriented observability).
 
 ## Quick E2E Demo
@@ -113,7 +129,36 @@ docker compose up --build -d notification
 4. In doctor dashboard, verify new alert + websocket event.
 5. Wait escalation interval and verify escalation notification/audit entry.
 6. Acknowledge alert and verify status/event update.
-7. Login as `patient1`, send chatbot message, verify response is advisory-only (`escalated=false`).
+7. Click floating **Chatbot** button (bottom-right), send message as `patient1`, verify advisory-only response (`escalated=false`).
+
+## Full UI Usage Checklist
+
+Use this sequence to verify all important in-app functions without API tools:
+
+1. **Login and route**
+   - Login as a role and verify redirect to role page (`/admin`, `/doctor`, `/patient`, `/relative`, `/simulator`).
+2. **Doctor actions**
+   - Click `Load Alert Dashboard`, `Load Charts`, `Load AI Predictions`.
+   - Confirm websocket badge reaches `connected` (or click `Reconnect WebSocket`).
+   - Acknowledge one `OPEN` alert from `Open Alerts (Acknowledge)`.
+3. **Admin actions**
+   - Load relative requests, queue health, audit log, and retry failed events.
+   - Verify `Admin Operations Center` stats and audit table populate.
+4. **Simulator actions**
+   - Start auto mode (one/some/all patient IDs) and verify readings generate continuously.
+5. **Patient/Caregiver actions**
+   - Load portal/dashboard and confirm patient-scoped charts + predictions.
+6. **Chatbot popup**
+   - Open floating `Chatbot` button and send a message.
+   - Verify response includes risk level and provider strategy label (`OPENAI`, `GEMINI`, or `LOCAL_RULES`).
+7. **Notifications + events**
+   - Open notifications table and realtime events panel; verify new rows/events appear after ingestion.
+
+## Graphs and Predictions Behavior
+
+- **Graph Range** controls only chart display window (30/60/120/240 points).
+- AI prediction table is loaded independently with **Load AI Predictions** buttons.
+- AI prediction panel visibility can be toggled with **Open AI Predictions / Close AI Predictions**.
 
 ## Verify Functions via API
 
@@ -182,7 +227,7 @@ Expected chatbot behavior: `risk_level` may be high/critical, but `escalated=fal
 
 ## See Metrics
 
-- UI: Admin and Simulator dashboards
+- UI: Admin Operations Center and Simulator Control Hub dashboards
 - API:
 
 ```bash
@@ -192,6 +237,21 @@ curl -s http://localhost:8000/v1/system/metrics \
 
 Includes ingestion rate, outbox health, queue depth/consumers, and outbox publish latency percentiles.
 Queue health also reports DLQ message count for failed consumer payloads.
+
+## Frontend Highlights (Latest)
+
+- **Doctor Monitoring Hub**
+  - open-alert table with in-UI acknowledge action
+  - websocket status badge and reconnect handling
+- **Admin Operations Center**
+  - queue health and DLQ visibility
+  - audit table preview
+  - failed-event retry action from UI
+- **Simulator Control Hub**
+  - one/some/all patient auto-stream controls
+- **Live Chatbot Popup**
+  - floating chatbot button with popup conversation panel
+  - advisory triage only (no direct chatbot-triggered escalation)
 
 ## Automated Tests (NFR-07)
 
@@ -279,7 +339,15 @@ docker compose logs -f gateway
 docker compose restart gateway
 ```
 
-- If OpenAI key is not set, chatbot automatically falls back to local triage (still advisory-only).
+- If websocket remains disconnected in UI:
+
+```bash
+docker compose restart notification gateway
+```
+
+Then hard refresh browser (`Ctrl+Shift+R`) and click `Reconnect WebSocket` in the app.
+
+- If OpenAI/Gemini keys are missing or provider calls fail, chatbot automatically falls back to local triage (still advisory-only).
 
 ## Notes for Report (Task 4)
 
@@ -295,7 +363,10 @@ docker compose restart gateway
 - Prediction outputs are persisted to `prediction_records` for traceability and historical review.
 - Notification service consumes both `ALERT_CREATED` and `RISK_PREDICTED`; high prediction severity creates prediction-based alerts.
 - Escalation mediator consumes `ALERT_CREATED` for critical alerts and executes timed escalation steps until acknowledgment or exhaustion.
-- Chatbot uses OpenAI by default (`OPENAI_CHATBOT_ENABLED=true`). If `OPENAI_API_KEY` is missing or call fails, it safely falls back to local rule-based triage.
+- Chatbot triage uses Strategy + Adapter + Factory Method: a chatbot factory builds provider strategies (OpenAI -> Gemini -> local rules) and shared response adapter(s).
+- Task 3.2 implementation-pattern set emphasizes Publish-Subscribe, Strategy, Adapter, and Factory Method for the current prototype scope.
+- OpenAI is enabled by default (`OPENAI_CHATBOT_ENABLED=true`), Gemini is optional (`GEMINI_CHATBOT_ENABLED=true`).
+- If provider keys are missing or calls fail, fallback safely continues to the next strategy, ending with local rule-based triage.
 - Gateway currently provides routing and WebSocket proxying for the prototype. Centralized gateway token validation and rate limiting are deferred to production hardening.
 - Admin and Simulator dashboards expose observable NFR-oriented metrics (ingestion rate, active patients, outbox health, queue depth/consumers, and outbox publish latency percentiles).
 - Auto mode supports one, some, or all patient IDs simultaneously for workload and scalability demonstrations.

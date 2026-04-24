@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import threading
 import time
+from typing import Protocol
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -33,7 +34,8 @@ from .models import (
     VitalReading,
 )
 from .schemas import RegisterRequest, RegisterResponse, VitalIngestRequest, VitalIngestResponse
-from .services import calculate_risk_score, create_audit_log, evaluate_alert
+from .services import create_audit_log
+from .vital_observer import VitalObservationContext, build_default_vital_subject
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 logger = logging.getLogger("vitaltrack.ingestion")
@@ -42,6 +44,43 @@ notification_bridge: RabbitMQBridge | None = None
 prediction_bridge: RabbitMQBridge | None = None
 outbox_stop_event = threading.Event()
 outbox_thread: threading.Thread | None = None
+vital_subject = build_default_vital_subject()
+
+
+class VitalSourceAdapter(Protocol):
+    """Adapter interface for source-specific payload normalization."""
+
+    def adapt(self, payload: VitalIngestRequest) -> dict:
+        ...
+
+
+class GenericVitalSourceAdapter:
+    def adapt(self, payload: VitalIngestRequest) -> dict:
+        return {
+            "patient_id": payload.patient_id,
+            "heart_rate": payload.heart_rate,
+            "spo2": payload.spo2,
+            "bp_sys": payload.bp_sys,
+            "bp_dia": payload.bp_dia,
+            "respiratory_rate": payload.respiratory_rate,
+            "temperature": payload.temperature,
+            "source": payload.source.strip().lower(),
+        }
+
+
+class SimulatorVitalSourceAdapter(GenericVitalSourceAdapter):
+    def adapt(self, payload: VitalIngestRequest) -> dict:
+        normalized = super().adapt(payload)
+        normalized["source"] = "simulator"
+        return normalized
+
+
+class VitalSourceAdapterFactory:
+    @staticmethod
+    def create(source: str) -> VitalSourceAdapter:
+        if source.strip().lower() == "simulator":
+            return SimulatorVitalSourceAdapter()
+        return GenericVitalSourceAdapter()
 
 
 def _publish_pending_outbox():
@@ -207,26 +246,34 @@ def ingest_vitals(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles(UserRole.SIMULATOR, UserRole.DOCTOR, UserRole.ADMIN)),
 ):
+    adapter = VitalSourceAdapterFactory.create(payload.source)
+    normalized = adapter.adapt(payload)
+
     patient = db.scalar(select(Patient).where(Patient.id == payload.patient_id))
     if patient is None:
         raise HTTPException(status_code=404, detail="Patient not found")
 
     reading = VitalReading(
-        patient_id=payload.patient_id,
+        patient_id=normalized["patient_id"],
         ts=datetime.now(timezone.utc),
-        heart_rate=payload.heart_rate,
-        spo2=payload.spo2,
-        bp_sys=payload.bp_sys,
-        bp_dia=payload.bp_dia,
-        respiratory_rate=payload.respiratory_rate,
-        temperature=payload.temperature,
-        source=payload.source,
+        heart_rate=normalized["heart_rate"],
+        spo2=normalized["spo2"],
+        bp_sys=normalized["bp_sys"],
+        bp_dia=normalized["bp_dia"],
+        respiratory_rate=normalized["respiratory_rate"],
+        temperature=normalized["temperature"],
+        source=normalized["source"],
     )
     db.add(reading)
     db.flush()
 
-    risk_score = calculate_risk_score(reading)
-    should_alert, severity, rule_code, message = evaluate_alert(reading, risk_score)
+    observation = VitalObservationContext(reading=reading)
+    vital_subject.notify(observation)
+    risk_score = observation.risk_score
+    should_alert = observation.should_alert
+    severity = observation.severity
+    rule_code = observation.rule_code
+    message = observation.message
     alert_created = False
     alert: Alert | None = None
 
@@ -267,14 +314,14 @@ def ingest_vitals(
                 "VITAL_RECEIVED",
                 {
                     "reading_id": reading.id,
-                    "patient_id": payload.patient_id,
-                    "heart_rate": payload.heart_rate,
-                    "spo2": payload.spo2,
-                    "bp_sys": payload.bp_sys,
-                    "bp_dia": payload.bp_dia,
-                    "respiratory_rate": payload.respiratory_rate,
-                    "temperature": payload.temperature,
-                    "source": payload.source,
+                    "patient_id": normalized["patient_id"],
+                    "heart_rate": normalized["heart_rate"],
+                    "spo2": normalized["spo2"],
+                    "bp_sys": normalized["bp_sys"],
+                    "bp_dia": normalized["bp_dia"],
+                    "respiratory_rate": normalized["respiratory_rate"],
+                    "temperature": normalized["temperature"],
+                    "source": normalized["source"],
                     "risk_score": risk_score,
                 },
             ),
