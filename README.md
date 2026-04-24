@@ -244,7 +244,85 @@ curl -s http://localhost:8000/v1/system/metrics \
 Includes ingestion rate, outbox health, queue depth/consumers, and outbox publish latency percentiles.
 Queue health also reports DLQ message count for failed consumer payloads.
 
-## Frontend Highlights (Latest)
+## Verify Outbox Functionality
+
+Use this checklist to confirm transactional outbox behavior end-to-end.
+
+### 1) Normal path check
+
+1. Login as simulator and send a critical reading.
+2. Verify alert appears in doctor dashboard/notifications.
+3. Check system metrics:
+
+```bash
+curl -s http://localhost:8000/v1/system/metrics \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
+
+Check `outbox.pending`, `outbox.published`, and `outbox.failed`.
+
+Expected:
+- `pending` increases briefly, then drains
+- `published` increases
+- downstream alert/event is visible
+
+### 2) DB-level outbox check
+
+```bash
+docker compose exec -T db psql -U vitaltrack -d vitaltrack -c "
+select event_type, status, count(*)
+from outbox_events
+group by event_type, status
+order by event_type, status;
+"
+```
+
+Latest rows:
+
+```bash
+docker compose exec -T db psql -U vitaltrack -d vitaltrack -c "
+select id, event_type, status, retry_count, created_at, published_at
+from outbox_events
+order by id desc
+limit 20;
+"
+```
+
+Expected:
+- new outbox rows are created on ingestion
+- status transitions to publish-complete state
+- `published_at` is populated for successful delivery
+
+### 3) Reliability test (broker outage + recovery)
+
+Stop RabbitMQ:
+
+```bash
+docker compose stop rabbitmq
+```
+
+Send vitals while broker is down (ingestion should still succeed).
+
+Start RabbitMQ again:
+
+```bash
+docker compose start rabbitmq
+```
+
+Expected after recovery (typically within seconds):
+- outbox pending backlog drains
+- published count increases
+- downstream alerts/notifications catch up
+
+### 4) Success criteria
+
+- Ingestion succeeds even if broker is temporarily unavailable.
+- Outbox stores undelivered events durably.
+- Backlog auto-publishes when broker returns.
+- No silent DB-commit/broker-publish event loss.
+
+
+## Frontend Highlights (New)
 
 - **Doctor Monitoring Hub**
   - open-alert table with in-UI acknowledge action
