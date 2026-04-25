@@ -1,0 +1,81 @@
+@startuml Sequence_Vital_Ingestion
+title Sequence Diagram - Vital Sign Ingestion with Alert Creation and Real-Time Notification
+
+actor Simulator as sim
+participant "API Gateway\n(Nginx)" as gw
+participant "Ingestion Service" as ingest
+database "PostgreSQL +\nTimescaleDB" as db
+participant "Outbox Worker\n(Background Thread)" as outbox
+queue "RabbitMQ" as mq
+participant "Notification Service\n(Alert Consumer)" as notif
+participant "Prediction Service\n(Vital Consumer)" as pred
+participant "Escalation Mediator\n(Consumer)" as esc
+participant "WebSocket Manager" as ws
+actor "Doctor\n(Dashboard)" as doc
+
+== Authentication ==
+sim -> gw : POST /auth/token
+gw -> ingest : Forward
+ingest -> db : Verify credentials (bcrypt)
+ingest --> gw : JWT (access_token)
+gw --> sim : Authenticated
+
+== Vital Ingestion ==
+sim -> gw : POST /v1/vitals + JWT
+gw -> ingest : Forward
+ingest -> ingest : Validate JWT, role,\npayload (Pydantic)
+ingest -> db : INSERT VitalReading
+ingest -> ingest : VitalSubject.notify()\n(Observer: RiskScoreObserver +\nAlertEvaluationObserver)
+
+alt Alert triggered (severity in {MEDIUM, HIGH, CRITICAL})
+    ingest -> db : INSERT Alert + AuditLog
+    ingest -> db : INSERT 3x OutboxEvent\n(VITAL_RECEIVED, ALERT_CREATED_NOTIFICATION,\nALERT_CREATED_ESCALATION)
+else No alert
+    ingest -> db : INSERT 1x OutboxEvent\n(VITAL_RECEIVED only)
+end
+
+ingest -> db : COMMIT (atomic transaction)
+ingest --> gw : VitalIngestResponse
+gw --> sim : 200 OK
+
+== Outbox Publishing (asynchronous) ==
+loop until no PENDING/FAILED rows
+    outbox -> db : SELECT pending events
+    outbox -> mq : publish to vitaltrack.vitals.received\n/ vitaltrack.notifications.events\n/ vitaltrack.escalation.events
+    alt Publish succeeds
+        outbox -> db : UPDATE status = PUBLISHED
+    else Publish fails
+        outbox -> db : UPDATE status = FAILED, retry_count++
+    end
+end
+
+== Notification Flow (consumer) ==
+mq -> notif : ALERT_CREATED
+notif -> db : Create Notification + AuditLog
+notif -> ws : broadcast(serialize_alert_event)
+ws -> doc : WebSocket push (real-time)
+
+== Prediction Flow (parallel consumer) ==
+mq -> pred : VITAL_RECEIVED
+pred -> pred : EarlyWarningStrategy.run()\n+ PersonalizedBaselineStrategy.run()\n(Strategy pattern)
+pred -> db : INSERT PredictionRecord,\nUPDATE PredictionBaseline
+pred -> mq : publish RISK_PREDICTED
+
+== Supplementary Risk Alert (optional, policy-driven) ==
+mq -> notif : RISK_PREDICTED
+opt combined_severity in {HIGH, CRITICAL} (per policy)
+    notif -> db : INSERT supplementary Alert + AuditLog\n(rule_code = RISK_PREDICTED)
+    notif -> ws : broadcast(supplementary_alert)
+    ws -> doc : WebSocket push
+end
+
+== Escalation Flow (parallel consumer) ==
+mq -> esc : ALERT_CREATED
+alt severity == CRITICAL and no existing case
+    esc -> db : INSERT EscalationCase (status=ACTIVE, step_index=0)
+    esc -> db : AuditLog (ESCALATION_CASE_STARTED)
+else Non-critical or duplicate
+    esc -> esc : Skip
+end
+
+@enduml

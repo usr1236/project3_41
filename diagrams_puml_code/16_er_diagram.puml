@@ -1,0 +1,175 @@
+@startuml ER_Diagram
+title VitalTrack - Entity-Relationship Diagram (Information Viewpoint)
+
+' UML class-diagram-style ER notation per course conventions.
+' PK = primary key, FK = foreign key.
+
+skinparam class {
+    BackgroundColor #FFF8DC
+    BorderColor #8B4513
+}
+
+entity "users" as users {
+    + **id** : int <<PK>>
+    --
+    username : str (unique)
+    password_hash : str
+    role : UserRole {ADMIN, DOCTOR, PATIENT, CAREGIVER, SIMULATOR}
+    created_at : datetime
+}
+
+entity "patients" as patients {
+    + **id** : int <<PK>>
+    --
+    user_id : int <<FK -> users.id, nullable>>
+    full_name : str
+    created_at : datetime
+}
+
+entity "vital_readings" as vitals <<TimescaleDB hypertable>> {
+    + **id** : int <<PK>>
+    + **ts** : datetime <<partitioning column>>
+    --
+    patient_id : int <<FK -> patients.id>>
+    heart_rate : int
+    spo2 : float
+    bp_sys : int
+    bp_dia : int
+    respiratory_rate : int
+    temperature : float
+    source : str
+}
+
+entity "alerts" as alerts {
+    + **id** : int <<PK>>
+    --
+    patient_id : int <<FK -> patients.id>>
+    severity : AlertSeverity {LOW, MEDIUM, HIGH, CRITICAL}
+    status : AlertStatus {OPEN, ACKNOWLEDGED, RESOLVED}
+    rule_code : str
+    message : str
+    ack_by : int <<FK -> users.id, nullable>>
+    ack_at : datetime nullable
+    created_at : datetime
+}
+
+entity "notifications" as notifs {
+    + **id** : int <<PK>>
+    --
+    alert_id : int <<FK -> alerts.id>>
+    channel : str
+    recipient : str
+    status : str
+    details : str
+    created_at : datetime
+}
+
+entity "audit_logs" as audit {
+    + **id** : int <<PK>>
+    --
+    actor_username : str
+    action : str
+    target_type : str
+    target_id : str
+    audit_metadata : jsonb
+    created_at : datetime
+}
+
+entity "outbox_events" as outbox {
+    + **id** : int <<PK>>
+    --
+    event_type : str
+    payload : jsonb
+    status : OutboxStatus {PENDING, PUBLISHED, FAILED}
+    retry_count : int
+    last_error : str nullable
+    created_at : datetime
+    published_at : datetime nullable
+}
+
+entity "failed_events" as failed {
+    + **id** : int <<PK>>
+    --
+    event_type : str
+    payload : str
+    error : str
+    retry_count : int
+    status : FailedEventStatus {PENDING, EXHAUSTED, RESOLVED}
+    created_at : datetime
+}
+
+entity "caregiver_assignments" as cg_assign {
+    + **id** : int <<PK>>
+    --
+    caregiver_user_id : int <<FK -> users.id>>
+    patient_id : int <<FK -> patients.id>>
+    created_at : datetime
+}
+
+entity "caregiver_link_requests" as cg_req {
+    + **id** : int <<PK>>
+    --
+    caregiver_user_id : int <<FK -> users.id>>
+    patient_id : int <<FK -> patients.id>>
+    status : CaregiverRequestStatus {PENDING, APPROVED, REJECTED}
+    notes : str nullable
+    created_at : datetime
+    reviewed_at : datetime nullable
+}
+
+entity "prediction_baselines" as pred_base {
+    + **id** : int <<PK>>
+    --
+    patient_id : int <<FK -> patients.id>>
+    vital_name : str
+    sample_count : int
+    mean : float
+    m2 : float
+    updated_at : datetime
+}
+
+entity "prediction_records" as pred_rec {
+    + **id** : int <<PK>>
+    --
+    patient_id : int <<FK -> patients.id>>
+    reading_id : int <<FK -> vital_readings.id, nullable>>
+    ews_score : float
+    ews_severity : str
+    baseline_max_z : float
+    baseline_severity : str
+    combined_severity : str
+    strategy_versions : jsonb
+    factors : jsonb
+    predicted_at : datetime
+}
+
+entity "escalation_cases" as esc {
+    + **id** : int <<PK>>
+    --
+    alert_id : int <<FK -> alerts.id, unique>>
+    status : EscalationCaseStatus {ACTIVE, COMPLETED, EXHAUSTED, CANCELLED}
+    step_index : int
+    next_due_at : datetime
+    last_recipient_role : str nullable
+    created_at : datetime
+    updated_at : datetime
+}
+
+' Relationships (cardinality at both ends)
+users "1" -- "0..1" patients : has
+users "1" -- "*" cg_assign : caregiver_for
+patients "1" -- "*" cg_assign : assigned_to
+users "1" -- "*" cg_req : requests
+patients "1" -- "*" cg_req : target_of
+
+patients "1" -- "*" vitals : records
+patients "1" -- "*" alerts : has
+patients "1" -- "*" pred_base : baselines
+patients "1" -- "*" pred_rec : predictions
+
+vitals "1" -- "0..1" pred_rec : analyzed_by
+alerts "1" -- "*" notifs : generates
+alerts "1" -- "0..1" esc : may_trigger
+alerts "1" -- "0..1" users : ack_by
+
+@enduml

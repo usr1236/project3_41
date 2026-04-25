@@ -1,0 +1,66 @@
+@startuml UseCase_Diagram_Overview
+title VitalTrack - Use Case Overview
+
+left to right direction
+
+actor "Patient" as patient
+actor "Doctor /\nHealthcare Provider" as doctor
+actor "On-Call Doctor" as oncall
+actor "Caregiver /\nFamily Member" as caregiver
+actor "Administrator" as admin
+actor "Device Simulator" as simulator
+
+rectangle "VitalTrack Platform" {
+    usecase "Authenticate and Login" as UC_AUTH
+    usecase "Register Account\n(Patient/Caregiver)\n<<prototype only: Doctor>>" as UC_REGISTER
+    usecase "Submit Vital Signs" as UC_INGEST
+    usecase "Monitor Alerts and Dashboards" as UC_MONITOR
+    usecase "Acknowledge Alerts" as UC_ACK
+    usecase "View Patient Data and Predictions" as UC_DATA
+    usecase "Use Health Chatbot\n(advisory-only)" as UC_CHAT
+    usecase "Manage Caregiver Access\n(admin-mediated approval)" as UC_CG
+    usecase "Administer Platform and Audit" as UC_ADMIN
+    usecase "Run Escalation Workflow\n(critical alerts only)" as UC_ESC
+}
+
+patient --> UC_AUTH
+patient --> UC_REGISTER
+patient --> UC_DATA
+patient --> UC_CHAT
+
+doctor --> UC_AUTH
+doctor --> UC_REGISTER
+doctor --> UC_INGEST
+doctor --> UC_MONITOR
+doctor --> UC_ACK
+doctor --> UC_DATA
+doctor --> UC_CHAT
+
+oncall --> UC_AUTH
+oncall --> UC_MONITOR
+oncall --> UC_ACK
+
+caregiver --> UC_AUTH
+caregiver --> UC_REGISTER
+caregiver --> UC_DATA
+caregiver --> UC_CHAT
+caregiver --> UC_CG
+
+admin --> UC_AUTH
+admin --> UC_MONITOR
+admin --> UC_ACK
+admin --> UC_CG
+admin --> UC_ADMIN
+
+simulator --> UC_AUTH
+simulator --> UC_INGEST
+
+' Corrected: escalation is triggered by alert creation event (from ingestion),
+' not by the monitoring use case.
+UC_INGEST ..> UC_MONITOR : <<updates>>
+UC_INGEST ..> UC_DATA : <<triggers predictions>>
+UC_INGEST ..> UC_ESC : <<creates critical alert\nthat may escalate>>
+UC_ACK ..> UC_MONITOR : <<broadcast update>>
+UC_ESC ..> UC_ACK : <<recipients can ack\nat any step>>
+
+@enduml

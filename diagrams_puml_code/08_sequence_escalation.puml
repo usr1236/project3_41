@@ -1,0 +1,53 @@
+@startuml Sequence_Escalation
+title Sequence Diagram - Critical Alert Escalation Workflow
+
+participant "Escalation Consumer" as consumer
+queue "RabbitMQ\n(escalation queue)" as mq
+database "PostgreSQL" as db
+participant "Escalation Worker\n(Background Thread)" as worker
+participant "Notification Service" as notif
+participant "WebSocket Manager" as ws
+actor "Primary Doctor" as doc1
+actor "On-Call Doctor" as doc2
+actor "Caregiver" as cg
+actor "Admin" as adm
+
+== Phase 1: Case Creation (on ALERT_CREATED) ==
+mq -> consumer : Deliver ALERT_CREATED\n{alert_id: 42}
+consumer -> db : Lookup Alert\n(must be CRITICAL,\nno existing case)
+consumer -> db : INSERT EscalationCase\n(status=ACTIVE, step_index=0,\nnext_due_at=now+interval)
+consumer -> db : AuditLog (ESCALATION_CASE_STARTED)
+consumer -> db : COMMIT
+
+== Phase 2: Worker Loop (polls every 2s) ==
+loop while case status == ACTIVE
+    worker -> db : SELECT cases WHERE next_due_at <= now()
+
+    alt Alert.status in {ACKNOWLEDGED, RESOLVED}
+        worker -> db : UPDATE EscalationCase status=COMPLETED
+        worker -> db : AuditLog (ESCALATION_COMPLETED_ON_ACK)
+    else step_index >= len(RECIPIENT_CHAIN)
+        worker -> db : UPDATE EscalationCase status=EXHAUSTED
+        worker -> db : AuditLog (ESCALATION_EXHAUSTED)
+    else continue
+        worker -> worker : recipient_role =\nRECIPIENT_CHAIN[step_index]\n(0=PRIMARY, 1=ON_CALL,\n2=CAREGIVER, 3=ADMIN)
+        worker -> db : INSERT Notification\n(channel=IN_APP_ESCALATION,\nrecipient=resolved_username_or_fallback)
+        worker -> db : UPDATE EscalationCase\n(step_index++, next_due_at=now+interval)
+        worker -> db : AuditLog (ESCALATION_STEP_DISPATCHED)
+        opt escalation recipient delivery view
+            ws -> cg : Receive escalation notification (step 3)
+            ws -> adm : Receive escalation notification (step 4)
+        end
+    end
+end
+
+== Acknowledgment During Escalation (any step recipient) ==
+doc1 -> notif : POST /v1/alerts/42/ack\n+ JWT
+notif -> notif : require_roles(DOCTOR, ADMIN)
+notif -> db : UPDATE Alert status=ACKNOWLEDGED
+notif -> db : AuditLog (ALERT_ACKNOWLEDGED)
+notif -> ws : broadcast(ack_event)
+ws -> doc1 : Confirmation
+ws -> doc2 : Receive ack broadcast
+
+@enduml

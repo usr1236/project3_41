@@ -1,0 +1,62 @@
+@startuml Class_Factory
+title VitalTrack - DP-04 Factory Method (ChatbotTriageFactory)
+
+skinparam classAttributeIconSize 0
+
+class ChatbotTriageFactory <<factory>> {
+    +{static} create_response_adapter(): TriageResponseAdapter
+    +{static} create_strategies(): list<ChatbotTriageStrategy>
+}
+
+interface TriageResponseAdapter <<Protocol>> {
+    +adapt(raw_text: str): tuple<str, str>
+}
+
+class JsonTriageResponseAdapter {
+    +adapt(raw_text: str): tuple<str, str>
+}
+
+interface ChatbotTriageStrategy <<Protocol>> {
+    +name: str
+    +triage(message, latest_vital): tuple<str, str>
+}
+
+class OpenAITriageStrategy {
+    +name = "openai"
+    -adapter: TriageResponseAdapter
+}
+
+class GeminiTriageStrategy {
+    +name = "gemini"
+    -adapter: TriageResponseAdapter
+}
+
+class LocalRulesTriageStrategy {
+    +name = "local_rules"
+}
+
+class ChatbotEndpoint <<client>> {
+    +chatbot_message(payload, user): ChatbotMessageResponse
+}
+
+' Realization (dashed + hollow triangle per UML conventions)
+TriageResponseAdapter <|.. JsonTriageResponseAdapter
+ChatbotTriageStrategy <|.. OpenAITriageStrategy
+ChatbotTriageStrategy <|.. GeminiTriageStrategy
+ChatbotTriageStrategy <|.. LocalRulesTriageStrategy
+
+' Factory creates products
+ChatbotTriageFactory ..> JsonTriageResponseAdapter : <<creates>>
+ChatbotTriageFactory ..> OpenAITriageStrategy : <<creates>>
+ChatbotTriageFactory ..> GeminiTriageStrategy : <<creates>>
+ChatbotTriageFactory ..> LocalRulesTriageStrategy : <<creates>>
+
+' Strategies share the adapter
+OpenAITriageStrategy o--> "1" TriageResponseAdapter : shared
+GeminiTriageStrategy o--> "1" TriageResponseAdapter : shared
+
+' Client uses the factory
+ChatbotEndpoint ..> ChatbotTriageFactory : <<uses>>
+ChatbotEndpoint o--> "*" ChatbotTriageStrategy : ordered chain
+
+@enduml

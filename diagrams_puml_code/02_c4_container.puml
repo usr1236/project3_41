@@ -1,0 +1,96 @@
+@startuml C4_Container_Diagram
+title C4 Container Diagram - VitalTrack Platform
+
+skinparam defaultTextAlignment center
+skinparam roundCorner 10
+skinparam shadowing false
+skinparam ArrowFontSize 10
+skinparam wrapWidth 200
+
+skinparam actor {
+    BackgroundColor #08427B
+    FontColor #FFFFFF
+    BorderColor #073B6F
+}
+skinparam rectangle<<container>> {
+    BackgroundColor #438DD5
+    FontColor #FFFFFF
+    BorderColor #3E81C7
+}
+skinparam rectangle<<db>> {
+    BackgroundColor #438DD5
+    FontColor #FFFFFF
+    BorderColor #3E81C7
+}
+skinparam rectangle<<queue>> {
+    BackgroundColor #438DD5
+    FontColor #FFFFFF
+    BorderColor #3E81C7
+}
+skinparam rectangle<<external>> {
+    BackgroundColor #999999
+    FontColor #FFFFFF
+    BorderColor #777777
+}
+skinparam rectangle<<future>> {
+    BackgroundColor #BFBFBF
+    FontColor #333333
+    BorderColor #777777
+    BorderStyle dashed
+}
+skinparam rectangle<<boundary>> {
+    BackgroundColor transparent
+    BorderColor #444444
+    BorderStyle dashed
+    FontColor #444444
+}
+
+actor "Patient" as patient
+actor "Doctor" as doctor
+actor "On-Call\nDoctor" as oncall
+actor "Caregiver" as caregiver
+actor "Admin" as admin
+actor "Device\nSimulator" as simulator
+
+rectangle "VitalTrack Platform" <<boundary>> {
+    rectangle "**API Gateway**\n[Container: Nginx 1.27]\n\nReverse proxy, single entry point,\nWebSocket upgrade, path-based routing" as gateway <<container>>
+    rectangle "**Frontend SPA**\n[Container: React / Vite]\n\nRole-based dashboards, real-time\nWebSocket, patient portal, chatbot UI" as frontend <<container>>
+    rectangle "**Ingestion Service**\n[Container: FastAPI / Python]\n\nVital ingestion, validation, threshold\nalert evaluation, JWT issuance,\ntransactional outbox" as ingestion <<container>>
+    rectangle "**Notification Service**\n[Container: FastAPI / Python]\n\nAlert lifecycle, dispatch, failed-event\nretry, WebSocket broadcast, chatbot,\ndashboards, admin APIs, audit" as notification <<container>>
+    rectangle "**Prediction Service**\n[Container: FastAPI / Python]\n\nRisk prediction via EWS +\npersonalized baseline (z-score) strategies" as prediction <<container>>
+    rectangle "**Escalation Mediator**\n[Container: FastAPI / Python]\n\nMulti-step escalation workflow with\ntimed recipient chain" as escalation <<container>>
+    database "**PostgreSQL +\nTimescaleDB**\n[Container: PostgreSQL 16]\n\nRelational + time-series\n(vital_readings hypertable)" as db <<db>>
+    queue "**RabbitMQ**\n[Container: RabbitMQ 3.13]\n\nDurable queues, DLX/DLQ,\nat-least-once delivery" as rabbitmq <<queue>>
+}
+
+rectangle "**OpenAI API**\n[External System]\nChatbot triage (primary)" as openai <<external>>
+rectangle "**Google Gemini API**\n[External System]\nChatbot triage (secondary)" as gemini <<external>>
+rectangle "**Email / SMS Providers**\n<<future extension>>" as email_sms <<future>>
+
+patient --> gateway : Uses\n[HTTPS]
+doctor --> gateway : Uses\n[HTTPS / WebSocket]
+oncall --> gateway : Uses\n[HTTPS / WebSocket]
+caregiver --> gateway : Uses\n[HTTPS]
+admin --> gateway : Uses\n[HTTPS]
+simulator --> gateway : Submits vitals\n[HTTPS REST]
+
+gateway --> frontend : Serves SPA\n[HTTP]
+gateway --> ingestion : /auth, /v1/vitals\n[HTTP]
+gateway --> notification : /v1/* (business APIs),\n/ws/doctor [HTTP / WebSocket]
+gateway --> prediction : /v1/prediction/health\n[HTTP]
+gateway --> escalation : /v1/escalation/health\n[HTTP]
+
+ingestion --> db : Reads/writes\n[SQLAlchemy]
+ingestion --> rabbitmq : Publishes via\noutbox worker [AMQP]
+notification --> db : Reads/writes\n[SQLAlchemy]
+notification --> rabbitmq : Consumes\nALERT_CREATED,\nRISK_PREDICTED [AMQP]
+prediction --> db : Reads/writes\n[SQLAlchemy]
+prediction --> rabbitmq : Consumes\nVITAL_RECEIVED,\npublishes\nRISK_PREDICTED [AMQP]
+escalation --> db : Reads/writes\n[SQLAlchemy]
+escalation --> rabbitmq : Consumes\nALERT_CREATED [AMQP]
+
+notification --> openai : Chatbot triage\n(advisory-only) [HTTPS]
+notification --> gemini : Chatbot triage\n(advisory-only) [HTTPS]
+notification ..> email_sms : <<future>>\nCritical alerts
+
+@enduml

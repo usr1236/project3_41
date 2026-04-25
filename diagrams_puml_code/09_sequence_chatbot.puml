@@ -1,0 +1,89 @@
+@startuml Sequence_Chatbot
+title Sequence Diagram - Health Chatbot (Advisory-Only Triage)
+
+actor Patient as pat
+participant "React Frontend\n(Chatbot UI)" as fe
+participant "API Gateway\n(Nginx)" as gw
+participant "Notification Service\n(Chatbot endpoint)" as notif
+participant "ChatbotTriageFactory" as factory
+participant "OpenAITriageStrategy" as openai_s
+participant "GeminiTriageStrategy" as gemini_s
+participant "LocalRulesTriageStrategy" as local_s
+participant "JsonTriageResponseAdapter" as adapter
+participant "OpenAI API" as openai
+participant "Gemini API" as gemini
+database "PostgreSQL" as db
+
+== Patient Sends Message ==
+pat -> fe : Type message
+fe -> gw : POST /v1/chatbot/message + JWT\n{message, patient_id}
+gw -> notif : Forward
+notif -> notif : require_roles(PATIENT, DOCTOR,\nADMIN, CAREGIVER)
+
+alt patient_id provided
+    notif -> notif : _can_access_patient()
+    alt access denied
+        notif --> gw : 403 Forbidden
+        gw --> fe : 403
+        fe --> pat : Access error
+    else access granted
+        notif -> db : SELECT latest VitalReading
+    end
+end
+
+== Strategy Chain (Factory builds order) ==
+notif -> factory : create_strategies()
+factory --> notif : [OpenAI, Gemini, LocalRules]\n(each wired with adapter)
+
+notif -> openai_s : triage(message, latest_vital)
+alt OPENAI_CHATBOT_ENABLED and key set
+    openai_s -> openai : POST /responses (JSON-mode)
+    alt valid JSON returned
+        openai --> openai_s : raw_text
+        openai_s -> adapter : adapt(raw_text)
+        adapter --> openai_s : (risk_level, reply)
+        openai_s --> notif : (risk_level, reply)\nstrategy_used = "openai"
+    else invalid response
+        openai_s --> notif : RuntimeError
+        notif -> gemini_s : triage(...)
+    end
+else OpenAI disabled / no key
+    notif -> gemini_s : triage(message, latest_vital)
+end
+
+opt fallback to Gemini
+    alt GEMINI_CHATBOT_ENABLED and key set
+        gemini_s -> gemini : POST /v1beta/.../generateContent
+        alt valid JSON returned
+            gemini --> gemini_s : raw_text
+            gemini_s -> adapter : adapt(raw_text)
+            adapter --> gemini_s : (risk_level, reply)
+            gemini_s --> notif : (risk_level, reply)\nstrategy_used = "gemini"
+        else invalid response
+            gemini_s --> notif : RuntimeError
+            notif -> local_s : triage(...)
+        end
+    else Gemini disabled / no key
+        notif -> local_s : triage(message, latest_vital)
+    end
+end
+
+opt final fallback to LocalRules
+    local_s -> local_s : keyword scoring\n(CRITICAL / MEDIUM / LOW)
+    local_s --> notif : (risk_level, reply)\nstrategy_used = "local_rules"
+end
+
+== Vital-Override Check ==
+opt latest_vital exists
+    notif -> notif : if SpO2 < 90 or HR > 130:\n  override risk_level = CRITICAL,\n  override reply with urgent text
+end
+
+== Audit + Response ==
+notif -> db : INSERT AuditLog\n(action=CHATBOT_MESSAGE,\nmetadata={advisory_only: true,\nstrategy_used, risk_level})
+notif -> db : COMMIT
+
+notif --> gw : ChatbotMessageResponse {\n  reply,\n  risk_level,\n  strategy_used,\n  escalated = false,\n  alert_id = null\n}
+gw --> fe : 200 OK
+fe --> pat : Display advisory response
+
+@enduml

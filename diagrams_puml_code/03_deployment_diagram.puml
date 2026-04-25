@@ -1,0 +1,85 @@
+@startuml Deployment_Diagram
+title VitalTrack - Deployment Diagram (Docker Compose)
+
+skinparam node {
+    BackgroundColor #F0F8FF
+    BorderColor #4682B4
+}
+skinparam database {
+    BackgroundColor #FFF8DC
+    BorderColor #DAA520
+}
+
+node "Host Machine" as host {
+    node "vitaltrack-gateway" as gw_node <<Docker Container>> {
+        artifact "Nginx 1.27 Alpine" as nginx
+    }
+
+    node "vitaltrack-frontend" as fe_node <<Docker Container>> {
+        artifact "Nginx (static)" as fe_nginx
+        artifact "React SPA Bundle (Vite)" as fe_app
+        fe_nginx --> fe_app
+    }
+
+    node "vitaltrack-ingestion" as ing_node <<Docker Container>> {
+        artifact "FastAPI / Uvicorn" as ing_app
+        artifact "Outbox Publisher\n(Background Thread)" as outbox_bg
+        artifact "Vital Subject (Observer)\nin-process pipeline" as vital_obs
+    }
+
+    node "vitaltrack-notification" as notif_node <<Docker Container>> {
+        artifact "FastAPI / Uvicorn" as notif_app
+        artifact "RabbitMQ Consumer\n(Background Thread)" as notif_consumer
+        artifact "WebSocket Manager" as ws_mgr
+        artifact "Chatbot Triage Chain\n(OpenAI -> Gemini -> Local)" as chatbot_chain
+    }
+
+    node "vitaltrack-prediction" as pred_node <<Docker Container>> {
+        artifact "FastAPI / Uvicorn" as pred_app
+        artifact "Vital Event Consumer" as pred_consumer
+    }
+
+    node "vitaltrack-escalation" as esc_node <<Docker Container>> {
+        artifact "FastAPI / Uvicorn" as esc_app
+        artifact "Escalation Consumer" as esc_consumer
+        artifact "Escalation Worker\n(ESCALATION_INTERVAL_SECONDS\nconfigurable)" as esc_worker
+    }
+
+    database "vitaltrack-db" as db_node <<Docker Container>> {
+        artifact "PostgreSQL 16\n+ TimescaleDB" as pg
+        storage "vitaltrack_data\n(Docker Volume)" as vol
+        pg --> vol
+    }
+
+    node "vitaltrack-rabbitmq" as mq_node <<Docker Container>> {
+        artifact "RabbitMQ 3.13\n+ Management" as rabbit
+    }
+}
+
+cloud "External Services" as ext {
+    node "OpenAI API" as openai_ext
+    node "Google Gemini API" as gemini_ext
+    node "Email / SMS Providers\n<<future extension>>" as smtp_ext
+}
+
+gw_node --> fe_node : HTTP
+gw_node --> ing_node : HTTP
+gw_node --> notif_node : HTTP/WS
+gw_node --> pred_node : HTTP
+gw_node --> esc_node : HTTP
+
+ing_node --> db_node : SQLAlchemy + psycopg2
+notif_node --> db_node : SQLAlchemy + psycopg2
+pred_node --> db_node : SQLAlchemy + psycopg2
+esc_node --> db_node : SQLAlchemy + psycopg2
+
+ing_node --> mq_node : AMQP (pika)
+notif_node --> mq_node : AMQP (pika)
+pred_node --> mq_node : AMQP (pika)
+esc_node --> mq_node : AMQP (pika)
+
+notif_node --> openai_ext : HTTPS (advisory-only)
+notif_node --> gemini_ext : HTTPS (advisory-only)
+notif_node ..> smtp_ext : <<future>> SMTP/SMS
+
+@enduml

@@ -1,0 +1,45 @@
+@startuml Class_Adapter
+title VitalTrack - DP-03 Adapter (JsonTriageResponseAdapter)
+
+skinparam classAttributeIconSize 0
+
+' ============ Target / Port (canonical internal contract) ============
+interface TriageResponseAdapter <<Protocol>> {
+    +adapt(raw_text: str): tuple<str, str>
+}
+
+' ============ Adapter implementation ============
+class JsonTriageResponseAdapter {
+    +adapt(raw_text: str): tuple<str, str>
+}
+
+' ============ Adaptees (heterogeneous external responses) ============
+class OpenAIRawResponse <<external>> {
+    +output_text: str
+}
+
+class GeminiRawResponse <<external>> {
+    +candidates[0].content.parts[*].text: str
+}
+
+' ============ Clients (Strategies that consume the canonical contract) ============
+class OpenAITriageStrategy {
+    -adapter: TriageResponseAdapter
+    +triage(message, latest_vital): tuple
+}
+
+class GeminiTriageStrategy {
+    -adapter: TriageResponseAdapter
+    +triage(message, latest_vital): tuple
+}
+
+' ============ Relationships ============
+TriageResponseAdapter <|.. JsonTriageResponseAdapter
+
+OpenAITriageStrategy --> TriageResponseAdapter : delegates parsing
+GeminiTriageStrategy --> TriageResponseAdapter : delegates parsing
+
+JsonTriageResponseAdapter ..> OpenAIRawResponse : <<adapts>>
+JsonTriageResponseAdapter ..> GeminiRawResponse : <<adapts>>
+
+@enduml

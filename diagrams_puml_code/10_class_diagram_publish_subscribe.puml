@@ -1,0 +1,79 @@
+@startuml Class_Publish_Subscribe
+title VitalTrack - DP-01 Publish-Subscribe (Class Diagram)
+
+left to right direction
+skinparam classAttributeIconSize 0
+
+class IngestionService {
+    +ingest_vitals(payload, user): VitalIngestResponse
+    -_publish_pending_outbox(): void
+}
+
+class OutboxPublisherWorker <<background thread>> {
+    +poll_pending(): list
+    +publish_pending(): void
+}
+
+class OutboxEvent {
+    +event_type: str
+    +payload: dict
+    +status: OutboxStatus
+    +retry_count: int
+}
+
+enum OutboxStatus {
+    PENDING
+    PUBLISHED
+    FAILED
+}
+
+class RabbitMQBridge {
+    +publish_event(payload, queue_name): bool
+    +start_consumer(): void
+    +stop_consumer(): void
+}
+
+class EventEnvelope <<utility>> {
+    +build_event_envelope(event_type, data, schema_version): dict
+    +parse_event_envelope(message): tuple
+}
+
+class NotificationService {
+    +handle_alert_created_event(payload): void
+    +handle_risk_predicted_event(payload): void
+}
+
+class PredictionService {
+    -_handle_vital_received(payload): void
+}
+
+class EscalationService {
+    -_handle_alert_created(payload): void
+}
+
+class RabbitMQQueues <<broker resource>> {
+    vitaltrack.vitals.received
+    vitaltrack.notifications.events
+    vitaltrack.escalation.events
+    <queue>.dlq (dead-letter)
+}
+
+' Producer side
+IngestionService "1" *-- "*" OutboxEvent : writes >
+OutboxEvent --> OutboxStatus
+IngestionService ..> EventEnvelope : <<uses>>
+OutboxPublisherWorker ..> OutboxEvent : <<reads PENDING/FAILED>>
+OutboxPublisherWorker ..> RabbitMQBridge : <<publishes>>
+RabbitMQBridge ..> RabbitMQQueues : <<routes>>
+
+' Consumer side
+RabbitMQQueues ..> PredictionService : <<delivers VITAL_RECEIVED>>
+RabbitMQQueues ..> NotificationService : <<delivers ALERT_CREATED, RISK_PREDICTED>>
+RabbitMQQueues ..> EscalationService : <<delivers ALERT_CREATED>>
+
+PredictionService ..> EventEnvelope : <<uses>>
+NotificationService ..> EventEnvelope : <<uses>>
+EscalationService ..> EventEnvelope : <<uses>>
+PredictionService ..> RabbitMQBridge : <<publishes RISK_PREDICTED>>
+
+@enduml

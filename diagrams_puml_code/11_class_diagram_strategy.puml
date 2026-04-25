@@ -1,0 +1,74 @@
+@startuml Class_Strategy
+title VitalTrack - DP-02 Strategy (Prediction + Chatbot Triage)
+
+skinparam classAttributeIconSize 0
+
+' ============ Prediction Strategy hierarchy ============
+package "Prediction Service" {
+    interface PredictionStrategy <<Protocol>> {
+        +run(db: Session, vital_event: dict): dict
+    }
+
+    class EarlyWarningStrategy {
+        +version = "news2-inspired-v1"
+        +run(db, vital_event): dict
+    }
+
+    class PersonalizedBaselineStrategy {
+        +version = "rolling-zscore-v1"
+        +warmup_samples = 10
+        +z_threshold = 2.5
+        +run(db, vital_event): dict
+        -_update_baseline(row, value): void
+        -_std(row): float
+    }
+
+    class PredictionService_ctx <<context>> {
+        +ews_strategy: PredictionStrategy
+        +baseline_strategy: PredictionStrategy
+        -_handle_vital_received(payload): void
+        -_combine_severity(values): str
+    }
+
+    PredictionStrategy <|.. EarlyWarningStrategy
+    PredictionStrategy <|.. PersonalizedBaselineStrategy
+    PredictionService_ctx o--> "1" EarlyWarningStrategy : ews
+    PredictionService_ctx o--> "1" PersonalizedBaselineStrategy : baseline
+}
+
+' ============ Chatbot Triage Strategy hierarchy ============
+package "Notification Service / Chatbot" {
+    interface ChatbotTriageStrategy <<Protocol>> {
+        +name: str
+        +triage(message: str, latest_vital): tuple
+    }
+
+    class OpenAITriageStrategy {
+        +name = "openai"
+        -adapter: TriageResponseAdapter
+        +triage(message, latest_vital): tuple
+    }
+
+    class GeminiTriageStrategy {
+        +name = "gemini"
+        -adapter: TriageResponseAdapter
+        +triage(message, latest_vital): tuple
+    }
+
+    class LocalRulesTriageStrategy {
+        +name = "local_rules"
+        +triage(message, latest_vital): tuple
+    }
+
+    class ChatbotEndpoint <<context>> {
+        +strategies: list<ChatbotTriageStrategy>
+        +chatbot_message(payload, user): ChatbotMessageResponse
+    }
+
+    ChatbotTriageStrategy <|.. OpenAITriageStrategy
+    ChatbotTriageStrategy <|.. GeminiTriageStrategy
+    ChatbotTriageStrategy <|.. LocalRulesTriageStrategy
+    ChatbotEndpoint o--> "*" ChatbotTriageStrategy : ordered chain\n[OpenAI, Gemini, Local]
+}
+
+@enduml

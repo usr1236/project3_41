@@ -1,0 +1,59 @@
+@startuml Class_Observer
+title VitalTrack - DP-05 Observer (In-Process Vital Processing)
+
+skinparam classAttributeIconSize 0
+
+class VitalSubject <<subject>> {
+    -_observers: list<VitalObserver>
+    +attach(observer: VitalObserver): void
+    +notify(context: VitalObservationContext): void
+}
+
+interface VitalObserver <<Protocol>> {
+    +update(context: VitalObservationContext): void
+}
+
+class RiskScoreObserver {
+    +update(context: VitalObservationContext): void
+}
+
+class AlertEvaluationObserver {
+    +update(context: VitalObservationContext): void
+}
+
+class VitalObservationContext <<dataclass>> {
+    +reading: VitalReading
+    +risk_score: float
+    +should_alert: bool
+    +severity: AlertSeverity
+    +rule_code: str
+    +message: str
+}
+
+class IngestionService <<client>> {
+    +vital_subject: VitalSubject
+    +ingest_vitals(payload, user): VitalIngestResponse
+}
+
+' Build helper (factory function)
+class build_default_vital_subject <<module function>> {
+    +(): VitalSubject
+}
+
+' Realization
+VitalObserver <|.. RiskScoreObserver
+VitalObserver <|.. AlertEvaluationObserver
+
+' Composition / association
+VitalSubject o--> "*" VitalObserver : observers
+VitalSubject ..> VitalObservationContext : <<notifies>>
+RiskScoreObserver ..> VitalObservationContext : <<updates>>
+AlertEvaluationObserver ..> VitalObservationContext : <<updates>>
+
+IngestionService o--> "1" VitalSubject : in-process pipeline
+IngestionService ..> build_default_vital_subject : <<creates via>>
+build_default_vital_subject ..> VitalSubject : <<returns>>
+build_default_vital_subject ..> RiskScoreObserver : <<attaches>>
+build_default_vital_subject ..> AlertEvaluationObserver : <<attaches>>
+
+@enduml

@@ -1,0 +1,23 @@
+@startuml State_EscalationCase
+title VitalTrack - State Machine: EscalationCase
+
+[*] --> ACTIVE : ALERT_CREATED received\n(severity == CRITICAL,\nno existing case)\n/ create case\n/ step_index = 0\n/ next_due_at = now + interval\n/ AuditLog ESCALATION_CASE_STARTED
+
+state ACTIVE {
+    [*] --> AwaitingDispatch
+    AwaitingDispatch --> AwaitingDispatch : worker poll\n[ now < next_due_at ]
+    AwaitingDispatch --> Dispatching : worker poll\n[ now >= next_due_at\n  and Alert.status == OPEN\n  and step_index < len(RECIPIENT_CHAIN) ]
+    Dispatching --> AwaitingDispatch : INSERT Notification\n/ step_index++\n/ next_due_at = now + interval\n/ AuditLog ESCALATION_STEP_DISPATCHED
+}
+
+ACTIVE --> COMPLETED : worker observes\nAlert.status in {ACKNOWLEDGED, RESOLVED}\n/ AuditLog ESCALATION_COMPLETED_ON_ACK
+
+ACTIVE --> EXHAUSTED : worker observes\nstep_index >= len(RECIPIENT_CHAIN)\n/ AuditLog ESCALATION_EXHAUSTED
+
+ACTIVE --> CANCELLED : Admin / operator override\n(manual termination)\n/ AuditLog ESCALATION_CANCELLED
+
+COMPLETED --> [*]
+EXHAUSTED --> [*]
+CANCELLED --> [*]
+
+@enduml

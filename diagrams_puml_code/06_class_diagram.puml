@@ -1,0 +1,221 @@
+@startuml Class_Diagram
+title VitalTrack - Class Diagram (Domain Models, Services, and Pattern Anchors)
+
+' ================ Enumerations ================
+enum UserRole {
+    ADMIN
+    DOCTOR
+    PATIENT
+    CAREGIVER
+    SIMULATOR
+}
+
+enum AlertSeverity {
+    LOW
+    MEDIUM
+    HIGH
+    CRITICAL
+}
+
+enum AlertStatus {
+    OPEN
+    ACKNOWLEDGED
+    RESOLVED
+}
+
+enum OutboxStatus {
+    PENDING
+    PUBLISHED
+    FAILED
+}
+
+enum FailedEventStatus {
+    PENDING
+    EXHAUSTED
+    RESOLVED
+}
+
+enum CaregiverRequestStatus {
+    PENDING
+    APPROVED
+    REJECTED
+}
+
+enum EscalationCaseStatus {
+    ACTIVE
+    COMPLETED
+    EXHAUSTED
+    CANCELLED
+}
+
+' ================ Domain Models ================
+class User {
+    +id: int
+    +username: str
+    +password_hash: str
+    +role: UserRole
+    +created_at: datetime
+}
+
+class Patient {
+    +id: int
+    +user_id: int | None
+    +full_name: str
+    +created_at: datetime
+}
+
+class CaregiverAssignment {
+    +id: int
+    +caregiver_user_id: int
+    +patient_id: int
+    +created_at: datetime
+}
+
+class CaregiverLinkRequest {
+    +id: int
+    +caregiver_user_id: int
+    +patient_id: int
+    +status: CaregiverRequestStatus
+    +notes: str | None
+    +created_at: datetime
+    +reviewed_at: datetime | None
+}
+
+class VitalReading {
+    +id: int
+    +patient_id: int
+    +ts: datetime
+    +heart_rate: int
+    +spo2: float
+    +bp_sys: int
+    +bp_dia: int
+    +respiratory_rate: int
+    +temperature: float
+    +source: str
+}
+
+class Alert {
+    +id: int
+    +patient_id: int
+    +severity: AlertSeverity
+    +rule_code: str
+    +message: str
+    +status: AlertStatus
+    +created_at: datetime
+    +ack_by: int | None
+    +ack_at: datetime | None
+}
+
+class Notification {
+    +id: int
+    +alert_id: int
+    +channel: str
+    +recipient: str
+    +status: str
+    +details: str
+    +created_at: datetime
+}
+
+class FailedEvent {
+    +id: int
+    +event_type: str
+    +payload: str
+    +error: str
+    +retry_count: int
+    +status: FailedEventStatus
+    +created_at: datetime
+}
+
+class AuditLog {
+    +id: int
+    +actor_username: str
+    +action: str
+    +target_type: str
+    +target_id: str
+    +audit_metadata: dict
+    +created_at: datetime
+}
+
+class OutboxEvent {
+    +id: int
+    +event_type: str
+    +payload: dict
+    +status: OutboxStatus
+    +retry_count: int
+    +last_error: str | None
+    +created_at: datetime
+    +published_at: datetime | None
+}
+
+class PredictionBaseline {
+    +id: int
+    +patient_id: int
+    +vital_name: str
+    +sample_count: int
+    +mean: float
+    +m2: float
+    +updated_at: datetime
+}
+
+class PredictionRecord {
+    +id: int
+    +patient_id: int
+    +reading_id: int | None
+    +ews_score: float
+    +ews_severity: str
+    +baseline_max_z: float
+    +baseline_severity: str
+    +combined_severity: str
+    +strategy_versions: dict
+    +factors: list
+    +predicted_at: datetime
+}
+
+class EscalationCase {
+    +id: int
+    +alert_id: int
+    +status: EscalationCaseStatus
+    +step_index: int
+    +next_due_at: datetime
+    +last_recipient_role: str | None
+    +created_at: datetime
+}
+
+' ================ Services ================
+class RiskScoreService <<service>> {
+    +calculate_risk_score(reading): float
+    +evaluate_alert(reading, risk_score): tuple
+}
+
+class NotificationService <<service>> {
+    +notify_doctors_or_capture_failure(db, alert): void
+    +retry_failed_events(db): tuple
+}
+
+class AuditService <<service>> {
+    +create_audit_log(db, actor, action, target_type, target_id, metadata): void
+}
+
+' ================ Relationships ================
+User "1" -- "0..1" Patient : has >
+User "1" -- "*" CaregiverAssignment : caregiver >
+Patient "1" -- "*" CaregiverAssignment : assigned to <
+Patient "1" -- "*" VitalReading : has >
+Patient "1" -- "*" Alert : has >
+Patient "1" -- "*" PredictionBaseline : has >
+Patient "1" -- "*" PredictionRecord : has >
+Patient "1" -- "*" CaregiverLinkRequest : target of <
+User "1" -- "*" CaregiverLinkRequest : requests >
+Alert "1" -- "*" Notification : generates >
+Alert "1" -- "0..1" EscalationCase : may trigger >
+User "0..1" <-- "0..*" Alert : acknowledged_by
+VitalReading "1" -- "0..1" PredictionRecord : analyzed by >
+
+RiskScoreService ..> VitalReading : <<uses>>
+RiskScoreService ..> Alert : <<creates>>
+NotificationService ..> Alert : <<uses>>
+NotificationService ..> Notification : <<creates>>
+NotificationService ..> FailedEvent : <<creates on failure>>
+AuditService ..> AuditLog : <<creates>>
+
+@enduml

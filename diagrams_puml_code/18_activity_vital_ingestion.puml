@@ -1,0 +1,118 @@
+@startuml Activity_Vital_Ingestion
+title Activity Diagram - Vital Sign Ingestion and Alert Processing
+
+skinparam ActivityBackgroundColor #FFF8DC
+skinparam ActivityBorderColor #8B4513
+skinparam ActivityDiamondBackgroundColor #F0F8FF
+skinparam PartitionBorderColor #4682B4
+
+start
+
+:Simulator/Doctor submits vital reading\n**POST /v1/vitals**;
+
+:API Gateway (Nginx) routes to\nIngestion Service;
+
+:Validate JWT and role\n(require_roles: SIMULATOR, DOCTOR, ADMIN);
+
+if (Authenticated and authorized?) then (no)
+    :Return 401/403 Unauthorized;
+    stop
+else (yes)
+endif
+
+:Validate payload\n(Pydantic schema:\nheart_rate, spo2, bp_sys, bp_dia,\nrespiratory_rate, temperature, source);
+
+if (Payload valid?) then (no)
+    :Return 422 Validation Error;
+    stop
+else (yes)
+endif
+
+:Lookup Patient by patient_id;
+
+if (Patient exists?) then (no)
+    :Return 404 Patient Not Found;
+    stop
+else (yes)
+endif
+
+:INSERT VitalReading\n(persisted to vital_readings hypertable);
+
+:**vital_subject.notify(observation)**\n//(Observer pattern, DP-05)//;
+
+partition "VitalSubject Pipeline" {
+    :**RiskScoreObserver.update()**\ncalculate_risk_score(reading);
+    :**AlertEvaluationObserver.update()**\nevaluate_alert(reading, risk_score)\n//(rule evaluation logic)//;
+}
+
+partition "Alert Rule Chain" {
+    if (CriticalVitalsRule:\n**SpO2 < 88** or **HR > 130**?) then (yes)
+        :severity = **CRITICAL**\nrule_code = CRIT_VITALS\nmessage = "Critical vital signs detected";
+    else (no)
+        if (HighRiskScoreRule:\n**risk_score >= 20**?) then (yes)
+            :severity = **HIGH**\nrule_code = HIGH_RISK_SCORE\nmessage = "High short-term risk predicted";
+        else (no)
+            if (AbnormalTrendRule:\n**SpO2 < 92** or **temp > 38.5**?) then (yes)
+                :severity = **MEDIUM**\nrule_code = ABNORMAL_TREND\nmessage = "Abnormal trend detected";
+            else (no)
+                :should_alert = false\nrule_code = NORMAL;
+            endif
+        endif
+    endif
+}
+
+if (should_alert == true?) then (yes)
+    :INSERT Alert\n(severity, rule_code, message,\nstatus = OPEN);
+    :INSERT AuditLog\n(action = ALERT_CREATED);
+else (no)
+    :Continue without alert;
+endif
+
+partition "Outbox Staging (DP-01 Pub-Sub)" {
+    fork
+        :INSERT OutboxEvent\nevent_type = VITAL_RECEIVED\n(always staged);
+    fork again
+        if (Alert was created?) then (yes)
+            :INSERT OutboxEvent\nevent_type = ALERT_CREATED_NOTIFICATION;
+            :INSERT OutboxEvent\nevent_type = ALERT_CREATED_ESCALATION;
+            :INSERT AuditLog\n(action = ALERT_EVENT_ENQUEUED);
+        else (no)
+        endif
+    end fork
+}
+
+:**COMMIT** (atomic transaction:\nVitalReading + Alert + OutboxEvents + AuditLogs);
+
+:Return VitalIngestResponse\n{ reading_id, alert_created,\nrisk_score, severity };
+
+partition "Background: Outbox Publisher\n(separate thread, polls continuously)" {
+    repeat
+        :SELECT OutboxEvent\nWHERE status IN (PENDING, FAILED)\nORDER BY created_at;
+
+        while (Pending events to publish?) is (yes)
+            :Read next OutboxEvent;
+            :Wrap in event envelope\n(schema_version, event_type,\noccurred_at, data);
+
+            switch (event_type)
+            case (VITAL_RECEIVED)
+                :publish to **vitaltrack.vitals.received**;
+            case (ALERT_CREATED_NOTIFICATION)
+                :publish to **vitaltrack.notifications.events**;
+            case (ALERT_CREATED_ESCALATION)
+                :publish to **vitaltrack.escalation.events**;
+            endswitch
+
+            if (Broker ack received?) then (yes)
+                :UPDATE status = PUBLISHED,\npublished_at = now();
+            else (no)
+                :UPDATE status = FAILED,\nretry_count++,\nlast_error;
+            endif
+        endwhile (no more)
+
+        :Sleep until next poll interval;
+    repeat while (Worker running?) is (yes)
+}
+
+stop
+
+@enduml

@@ -1,0 +1,62 @@
+@startuml C4_Context_Diagram
+title C4 Context Diagram - VitalTrack Remote Patient Monitoring Platform
+
+skinparam defaultTextAlignment center
+skinparam roundCorner 10
+skinparam shadowing false
+skinparam ArrowFontSize 11
+skinparam wrapWidth 220
+
+skinparam actor {
+    BackgroundColor #08427B
+    FontColor #FFFFFF
+    BorderColor #073B6F
+}
+skinparam rectangle<<s>> {
+    BackgroundColor #1168BD
+    FontColor #FFFFFF
+    BorderColor #0E5BAB
+}
+skinparam rectangle<<external>> {
+    BackgroundColor #999999
+    FontColor #FFFFFF
+    BorderColor #777777
+}
+skinparam rectangle<<future>> {
+    BackgroundColor #BFBFBF
+    FontColor #333333
+    BorderColor #777777
+    BorderStyle dashed
+}
+
+actor "Patient" as patient
+actor "Doctor /\nHealthcare Provider" as doctor
+actor "On-Call Doctor" as oncall
+actor "Caregiver /\nFamily Member" as caregiver
+actor "System Administrator" as admin
+actor "Device Simulator" as simulator
+
+rectangle "**VitalTrack Platform**\n[System]\n\nSmart remote patient monitoring with\nAI-based risk prediction, alerting,\nchatbot, and role-based dashboards" as vitaltrack <<s>>
+
+rectangle "**OpenAI API**\n[External System]\n\nLLM chatbot triage (primary)" as openai <<external>>
+rectangle "**Google Gemini API**\n[External System]\n\nLLM chatbot triage (secondary)" as gemini <<external>>
+
+rectangle "**Wearable Devices / Sensors**\n<<future extension>>\nProduction direct ingestion;\nprototype uses Device Simulator" as wearable <<future>>
+rectangle "**Email / SMS Providers**\n<<future extension>>\nProduction critical-alert delivery;\nprototype uses in-app only" as email_sms <<future>>
+rectangle "**HL7 FHIR Systems**\n<<future extension>>\nStandards-based data exchange (NFR-09)" as fhir <<future>>
+
+patient --> vitaltrack : Views vitals & alerts,\nuses chatbot\n[HTTPS]
+doctor --> vitaltrack : Monitors dashboard,\nacknowledges alerts\n[HTTPS / WebSocket]
+oncall --> vitaltrack : Receives escalated alerts,\nacknowledges\n[HTTPS / WebSocket]
+caregiver --> vitaltrack : Views assigned patients,\nreceives escalation\n[HTTPS]
+admin --> vitaltrack : Manages users, audit,\ncaregiver requests\n[HTTPS]
+simulator --> vitaltrack : Submits vital readings\n[HTTPS REST]
+
+vitaltrack --> openai : Chatbot triage (primary)\n[HTTPS REST]
+vitaltrack --> gemini : Chatbot triage (fallback)\n[HTTPS REST]
+
+wearable ..> vitaltrack : <<future>>\nDirect ingestion
+vitaltrack ..> email_sms : <<future>>\nCritical alerts
+vitaltrack ..> fhir : <<future>>\nFHIR exchange
+
+@enduml

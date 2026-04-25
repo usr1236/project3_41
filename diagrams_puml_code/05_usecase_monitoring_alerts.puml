@@ -1,0 +1,55 @@
+@startuml UseCase_Monitoring_Alerts
+title VitalTrack - Use Cases: Monitoring, Alerts, and Escalation
+
+left to right direction
+
+actor "Doctor" as doctor
+actor "On-Call Doctor" as oncall
+actor "Administrator" as admin
+actor "Caregiver" as caregiver
+
+rectangle "VitalTrack Platform" {
+    package "Monitoring and Alerts" {
+        usecase "UC-06: View Active Alerts\n(Doctor Dashboard)" as UC06
+        usecase "UC-07: Acknowledge Alert" as UC07
+        usecase "UC-08: Receive Real-Time\nAlert Notifications" as UC08
+        usecase "UC-09: View Notifications" as UC09
+        usecase "UC-10: Retry Failed\nNotifications" as UC10
+    }
+
+    package "Escalation (Critical alerts only)" {
+        usecase "UC-13a: Receive Step 1\nEscalation (Primary Doctor)" as UC13a
+        usecase "UC-13b: Receive Step 2\nEscalation (On-Call Doctor)" as UC13b
+        usecase "UC-13c: Receive Step 3\nEscalation (Caregiver/Family)" as UC13c
+        usecase "UC-13d: Receive Step 4\nEscalation (Admin)" as UC13d
+    }
+}
+
+doctor --> UC06
+doctor --> UC07
+doctor --> UC08
+doctor --> UC09
+doctor --> UC10
+doctor --> UC13a
+
+oncall --> UC06
+oncall --> UC07
+oncall --> UC08
+oncall --> UC13b
+
+caregiver --> UC09
+caregiver --> UC13c
+
+admin --> UC06
+admin --> UC07
+admin --> UC08
+admin --> UC10
+admin --> UC13d
+
+UC07 ..> UC08 : <<broadcast ack via WebSocket>>
+UC13a ..> UC13b : <<after ESCALATION_INTERVAL\nif unacknowledged>>
+UC13b ..> UC13c : <<after ESCALATION_INTERVAL\nif unacknowledged>>
+UC13c ..> UC13d : <<after ESCALATION_INTERVAL\nif unacknowledged>>
+UC07 ..> UC13a : <<acknowledgment\nstops escalation>>
+
+@enduml

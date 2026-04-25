@@ -1,0 +1,102 @@
+@startuml Activity_Escalation
+title Activity Diagram - Critical Alert Escalation Workflow
+
+skinparam ActivityBackgroundColor #FFF8DC
+skinparam ActivityBorderColor #8B4513
+skinparam ActivityDiamondBackgroundColor #F0F8FF
+skinparam PartitionBorderColor #4682B4
+
+partition "Phase 1: Case Creation\n(triggered by ALERT_CREATED)" {
+    start
+    :Escalation consumer receives event\nfrom **vitaltrack.escalation.events**;
+
+    :parse_event_envelope(message);
+
+    if (event_type == ALERT_CREATED?) then (no)
+        :Ignore (basic_ack, log warning);
+        stop
+    else (yes)
+    endif
+
+    :Lookup Alert by alert_id;
+
+    if (Alert exists?) then (no)
+        :Skip (alert may have been purged);
+        stop
+    else (yes)
+    endif
+
+    if (severity == **CRITICAL**?) then (no)
+        :Skip (escalation only for critical);
+        stop
+    else (yes)
+    endif
+
+    :Check existing EscalationCase\nWHERE alert_id = alert.id;
+
+    if (Case already exists?) then (yes)
+        :Skip (idempotent: prevents\nduplicate escalation on redelivery);
+        stop
+    else (no)
+    endif
+
+    :INSERT EscalationCase\nstatus = **ACTIVE**\nstep_index = 0\nnext_due_at = now + ESCALATION_INTERVAL;
+
+    :INSERT AuditLog\n(action = ESCALATION_CASE_STARTED);
+    :COMMIT;
+}
+
+partition "Phase 2: Worker Loop\n(polls every 2 seconds)" {
+    repeat
+        :SELECT EscalationCase\nWHERE status = ACTIVE\nAND next_due_at <= now()\nORDER BY next_due_at;
+
+        while (Unprocessed due cases?) is (yes)
+            :Load case + associated Alert;
+
+            if (Alert.status in {ACKNOWLEDGED, RESOLVED}?) then (yes → ack)
+                :UPDATE EscalationCase\nstatus = **COMPLETED**;
+                :INSERT AuditLog\n(ESCALATION_COMPLETED_ON_ACK);
+
+            elseif (case.step_index >= len(RECIPIENT_CHAIN)?) then (yes → exhausted)
+                :UPDATE EscalationCase\nstatus = **EXHAUSTED**;
+                :INSERT AuditLog\n(ESCALATION_EXHAUSTED,\nmetadata = { steps: 4 });
+
+            else (continue chain)
+                :recipient_role =\nRECIPIENT_CHAIN[step_index];
+
+                partition "Recipient Resolution" {
+                    switch (recipient_role)
+                    case (PRIMARY_DOCTOR)
+                        :SELECT first user\nWHERE role = DOCTOR;
+                    case (ON_CALL_DOCTOR)
+                        :SELECT second user WHERE role = DOCTOR\n(falls back to first if only one);
+                    case (CAREGIVER_OR_FAMILY)
+                        :SELECT users via\nCaregiverAssignment\nWHERE patient_id matches;
+                    case (ADMIN)
+                        :SELECT first user\nWHERE role = ADMIN;
+                    endswitch
+                }
+                :INSERT Notification\nchannel = IN_APP_ESCALATION\nrecipient = resolved username or fallback\nstatus = SENT;
+
+                :UPDATE EscalationCase\nstep_index++,\nlast_recipient_role = recipient_role,\nnext_due_at = now + ESCALATION_INTERVAL;
+
+                :INSERT AuditLog\n(ESCALATION_STEP_DISPATCHED,\nmetadata = { step_index, recipient_role });
+            endif
+
+            :COMMIT;
+        endwhile (no more due)
+
+        :Sleep 2 seconds;
+    repeat while (worker_stop_event not set?) is (yes)
+    -> stop signal;
+}
+
+partition "Optional: Manual Termination" {
+    :Admin invokes cancellation API\n(future extension);
+    :UPDATE EscalationCase\nstatus = **CANCELLED**;
+    :INSERT AuditLog\n(ESCALATION_CANCELLED,\nactor = admin username);
+}
+
+stop
+
+@enduml
