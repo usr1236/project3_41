@@ -1,0 +1,131 @@
+@startuml C4_Component_Notification
+title C4 Component Diagram (L3) - Notification Service
+
+skinparam defaultTextAlignment center
+skinparam roundCorner 10
+skinparam shadowing false
+skinparam ArrowFontSize 10
+skinparam wrapWidth 180
+
+skinparam rectangle<<component>> {
+    BackgroundColor #85BBF0
+    FontColor #000000
+    BorderColor #5D82A8
+}
+skinparam rectangle<<broker>> {
+    BackgroundColor #438DD5
+    FontColor #FFFFFF
+    BorderColor #3E81C7
+}
+skinparam rectangle<<external>> {
+    BackgroundColor #999999
+    FontColor #FFFFFF
+    BorderColor #777777
+}
+skinparam rectangle<<future>> {
+    BackgroundColor #BFBFBF
+    FontColor #333333
+    BorderColor #777777
+    BorderStyle dashed
+}
+database "PostgreSQL +\nTimescaleDB" as db
+queue "RabbitMQ\n(notifications queue)" as mq <<broker>>
+
+rectangle "**Notification Service** [Container: FastAPI]" as boundary {
+
+    package "Inbound APIs (REST + WebSocket)" {
+        rectangle "**Doctor Dashboard API**\nGET /v1/doctor/dashboard\n[FastAPI route]" as doc_dash <<component>>
+        rectangle "**Patient Portal API**\nGET /v1/patient/portal\n[FastAPI route]" as pat_portal <<component>>
+        rectangle "**Caregiver Dashboard API**\nGET /v1/caregiver/dashboard\n[FastAPI route]" as cg_dash <<component>>
+        rectangle "**Patient Data APIs**\nGET /v1/patients/{id}/vitals\n/stats /predictions\n[FastAPI routes]" as pat_data <<component>>
+        rectangle "**Notifications API**\nGET /v1/notifications\n[FastAPI route]" as notifs_api <<component>>
+        rectangle "**Alert Acknowledgment**\nPOST /v1/alerts/{id}/ack\n[FastAPI route]" as ack_api <<component>>
+        rectangle "**Chatbot Endpoint**\nPOST /v1/chatbot/message\n[FastAPI route]" as chatbot_ep <<component>>
+        rectangle "**Admin APIs**\n/v1/admin/users,\n/v1/admin/caregiver-requests/*,\n/v1/admin/caregiver-assignments,\n/v1/admin/patients\n[FastAPI routes]" as admin_apis <<component>>
+        rectangle "**Audit Log API**\nGET /v1/audit\n[FastAPI route]" as audit_api <<component>>
+        rectangle "**Failed-Event Retry**\nPOST /v1/failed-events/retry\n[FastAPI route]" as retry_api <<component>>
+        rectangle "**Queue Health Probe**\nGET /v1/queue/health\n[FastAPI route]" as queue_health <<component>>
+        rectangle "**System Metrics**\nGET /v1/system/metrics\n[FastAPI route]" as metrics <<component>>
+        rectangle "**WebSocket Channel**\n/ws/doctor\n[FastAPI WebSocket]" as ws_chan <<component>>
+    }
+
+    package "Cross-Cutting Modules" {
+        rectangle "**Auth Module**\nrequire_roles(...)\nverify_token, get_current_user\n[auth.py]" as auth_mod <<component>>
+        rectangle "**Access Control**\n_can_access_patient(\n  user, patient_id)\n[notification_main.py]" as access <<component>>
+    }
+
+    package "Domain Logic" {
+        rectangle "**ConnectionManager**\nactive_connections,\nbroadcast()\n[WebSocket fan-out]" as conn_mgr <<component>>
+        rectangle "**NotificationService**\nnotify_doctors_or_capture_failure()\nretry_failed_events()\n[services.py]" as notif_svc <<component>>
+        rectangle "**Alert Event Consumer**\nhandle_alert_created_event()\nhandle_risk_predicted_event()\n[notification_main.py]" as consumer <<component>>
+        rectangle "**Audit Service**\ncreate_audit_log()\n[services.py]" as audit_svc <<component>>
+    }
+
+    package "Chatbot (DP-02 Strategy + DP-03 Adapter + DP-04 Factory)" {
+        rectangle "**ChatbotTriageFactory**\ncreate_strategies(),\ncreate_response_adapter()\n[Factory]" as factory <<component>>
+        rectangle "**OpenAITriageStrategy**\n[Strategy 1]" as openai_s <<component>>
+        rectangle "**GeminiTriageStrategy**\n[Strategy 2]" as gemini_s <<component>>
+        rectangle "**LocalRulesTriageStrategy**\n[Strategy 3 - fallback]" as local_s <<component>>
+        rectangle "**JsonTriageResponseAdapter**\n[Adapter]" as adapter <<component>>
+    }
+}
+
+rectangle "OpenAI API\n[External]" as openai <<external>>
+rectangle "Google Gemini API\n[External]" as gemini <<external>>
+rectangle "Email / SMS Providers\n<<future>>" as smtp <<future>>
+
+doc_dash --> auth_mod : require_roles\n(DOCTOR, ADMIN)
+pat_portal --> auth_mod
+cg_dash --> auth_mod
+pat_data --> auth_mod
+notifs_api --> auth_mod
+ack_api --> auth_mod
+chatbot_ep --> auth_mod
+admin_apis --> auth_mod
+audit_api --> auth_mod
+retry_api --> auth_mod
+queue_health --> auth_mod
+metrics --> auth_mod
+
+pat_data --> access
+chatbot_ep --> access
+
+doc_dash --> db : SELECT open alerts
+pat_portal --> db : SELECT own vitals + alerts
+cg_dash --> db : SELECT assigned patients
+pat_data --> db : SELECT vitals/stats/predictions
+notifs_api --> db : SELECT notifications
+ack_api --> db : UPDATE Alert + AuditLog
+audit_api --> db : SELECT audit_logs
+admin_apis --> db : INSERT/UPDATE users,\ncaregiver_link_requests
+metrics --> db : SELECT aggregates
+
+ack_api --> conn_mgr : broadcast(ack_event)
+conn_mgr --> ws_chan : push to subscribers
+
+mq --> consumer : ALERT_CREATED,\nRISK_PREDICTED [AMQP]
+consumer --> notif_svc : dispatch
+consumer --> audit_svc : record event
+consumer --> conn_mgr : broadcast alert
+notif_svc --> db : INSERT Notification,\nFailedEvent on failure
+audit_svc --> db : INSERT AuditLog
+retry_api --> notif_svc : retry pending failed events
+
+chatbot_ep --> factory : create_strategies()
+factory --> openai_s : <<creates>>
+factory --> gemini_s : <<creates>>
+factory --> local_s : <<creates>>
+factory --> adapter : <<creates>>
+chatbot_ep --> openai_s : try first
+chatbot_ep --> gemini_s : try second\n(fallback)
+chatbot_ep --> local_s : final fallback
+openai_s --> adapter : delegates parsing
+gemini_s --> adapter : delegates parsing
+openai_s --> openai : POST /responses\n(JSON-mode)
+gemini_s --> gemini : POST /v1beta/.../generateContent
+chatbot_ep --> db : INSERT AuditLog\n(advisory_only)
+
+queue_health --> mq : passive queue declare
+notif_svc ..> smtp : <<future>>
+
+@enduml

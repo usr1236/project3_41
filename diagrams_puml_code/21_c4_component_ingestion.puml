@@ -1,0 +1,110 @@
+@startuml C4_Component_Ingestion
+title C4 Component Diagram (L3) - Ingestion Service
+
+skinparam defaultTextAlignment center
+skinparam roundCorner 10
+skinparam shadowing false
+skinparam ArrowFontSize 10
+skinparam wrapWidth 180
+
+skinparam rectangle<<component>> {
+    BackgroundColor #85BBF0
+    FontColor #000000
+    BorderColor #5D82A8
+}
+skinparam rectangle<<broker>> {
+    BackgroundColor #438DD5
+    FontColor #FFFFFF
+    BorderColor #3E81C7
+}
+database "PostgreSQL +\nTimescaleDB" as db
+queue "RabbitMQ\n(vitals + notifications + escalation queues)" as mq <<broker>>
+
+rectangle "**Ingestion Service** [Container: FastAPI]" as boundary {
+
+    package "Inbound APIs" {
+        rectangle "**Auth Token Endpoint**\nPOST /auth/token\n[FastAPI route]" as auth_ep <<component>>
+        rectangle "**Registration Endpoint**\nPOST /auth/register\n[FastAPI route]" as reg_ep <<component>>
+        rectangle "**Vital Ingestion Endpoint**\nPOST /v1/vitals\n[FastAPI route]" as vitals_ep <<component>>
+        rectangle "**Root Endpoint**\nGET /\n[FastAPI route]" as health_ep <<component>>
+    }
+
+    package "Cross-Cutting" {
+        rectangle "**Auth Module**\nauthenticate_user, create_access_token,\nverify_password (bcrypt),\nrequire_roles(...)\n[auth.py]" as auth_mod <<component>>
+    }
+
+    package "Source Adapter (DP-03 + DP-04 Factory)" {
+        rectangle "**VitalSourceAdapter** (Protocol)\n+adapt(payload): dict\n[ingestion_main.py]" as src_adapter_iface <<component>>
+        rectangle "**GenericVitalSourceAdapter**\n[default normalization]" as generic_adapter <<component>>
+        rectangle "**SimulatorVitalSourceAdapter**\n[forces source = 'simulator']" as sim_adapter <<component>>
+        rectangle "**VitalSourceAdapterFactory**\n+create(source) -> VitalSourceAdapter" as src_factory <<component>>
+    }
+
+    package "Domain Logic" {
+        rectangle "**Risk Score Service**\ncalculate_risk_score(reading)\n[services.py]" as risk_svc <<component>>
+        rectangle "**Alert Rule Chain**\n(Chain of Responsibility)\nCriticalVitalsRule -> HighRiskScoreRule\n-> AbnormalTrendRule\n[services.py]" as rule_chain <<component>>
+        rectangle "**Audit Service**\ncreate_audit_log()\n[services.py]" as audit_svc <<component>>
+    }
+
+    package "DP-05 Observer Pipeline (in-process)" {
+        rectangle "**VitalSubject**\nattach(observer), notify(context)\n[vital_observer.py]" as subject <<component>>
+        rectangle "**RiskScoreObserver**\n.update() -> calls Risk Score Service\n[vital_observer.py]" as risk_obs <<component>>
+        rectangle "**AlertEvaluationObserver**\n.update() -> calls Alert Rule Chain\n[vital_observer.py]" as alert_obs <<component>>
+        rectangle "**VitalObservationContext**\nshared dataclass\n(reading, risk_score, severity,\nrule_code, message)\n[vital_observer.py]" as ctx <<component>>
+        rectangle "**build_default_vital_subject**\nfactory function wiring\nthe default observer set\n[vital_observer.py]" as builder <<component>>
+    }
+
+    package "Transactional Outbox (ADR-008)" {
+        rectangle "**Outbox Writer**\nINSERT OutboxEvent rows in same\ntransaction as domain changes\n[ingestion_main.py]" as outbox_w <<component>>
+        rectangle "**Outbox Publisher Worker**\n_publish_pending_outbox()\nbackground thread\n[ingestion_main.py]" as outbox_pub <<component>>
+        rectangle "**Event Envelope Builder**\nbuild_event_envelope(\n  event_type, data, schema_version)\n[messaging.py]" as envelope <<component>>
+    }
+
+    package "Infrastructure" {
+        rectangle "**RabbitMQBridge**\npublish_event(payload, queue_name)\nstart/stop_consumer()\nDLX/DLQ setup\n[messaging.py]" as bridge <<component>>
+        rectangle "**DB Module**\nengine, SessionLocal,\nget_db dependency\n[db.py]" as db_mod <<component>>
+        rectangle "**ORM Models**\nUser, Patient, VitalReading, Alert,\nOutboxEvent, AuditLog,\nCaregiverAssignment, ...\n[models.py]" as models <<component>>
+    }
+}
+
+auth_ep --> auth_mod : authenticate_user,\ncreate_access_token
+auth_ep --> models : SELECT User,\nverify password
+reg_ep --> auth_mod : get_password_hash
+reg_ep --> models : INSERT User, Patient,\nCaregiverLinkRequest
+
+vitals_ep --> auth_mod : require_roles\n(SIMULATOR, DOCTOR, ADMIN)
+vitals_ep --> src_factory : create(source)
+src_factory --> generic_adapter : <<creates>>
+src_factory --> sim_adapter : <<creates if source=simulator>>
+src_adapter_iface <|.. generic_adapter
+src_adapter_iface <|.. sim_adapter
+vitals_ep --> src_adapter_iface : normalize payload
+vitals_ep --> models : INSERT VitalReading
+vitals_ep --> builder : creates default subject (at startup)
+builder --> subject : returns wired subject
+vitals_ep --> subject : notify(context)
+
+subject --> risk_obs : update(context)
+subject --> alert_obs : update(context)
+risk_obs --> risk_svc : calculate_risk_score(reading)
+risk_obs --> ctx : context.risk_score = ...
+alert_obs --> rule_chain : evaluate_alert(reading, score)
+alert_obs --> ctx : context.severity, rule_code, message
+
+vitals_ep --> models : INSERT Alert\n(if should_alert)
+vitals_ep --> audit_svc : ALERT_CREATED audit
+audit_svc --> models : INSERT AuditLog
+
+vitals_ep --> outbox_w : enqueue VITAL_RECEIVED\n+ optional ALERT_CREATED_*
+outbox_w --> envelope : wrap event
+outbox_w --> models : INSERT OutboxEvent
+
+vitals_ep --> db_mod : COMMIT (atomic)
+db_mod --> db : SQLAlchemy / psycopg2
+
+outbox_pub --> models : SELECT pending OutboxEvent
+outbox_pub --> bridge : publish_event(payload, queue)
+outbox_pub --> models : UPDATE status\n(PUBLISHED / FAILED)
+bridge --> mq : AMQP publish
+
+@enduml

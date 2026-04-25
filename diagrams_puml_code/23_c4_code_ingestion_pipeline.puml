@@ -1,0 +1,144 @@
+@startuml C4_Code_Ingestion_Pipeline
+title C4 Code Diagram (L4) - Vital Ingestion Pipeline\n(zoom into ingest_vitals + Observer + Outbox of Ingestion Service)
+
+skinparam classAttributeIconSize 0
+skinparam classFontSize 11
+skinparam classFontStyle plain
+skinparam wrapWidth 220
+
+class IngestVitalsEndpoint <<route>> {
+  +POST /v1/vitals
+  --
+  +ingest_vitals(\n  payload: VitalIngestRequest,\n  db: Session,\n  user: User\n): VitalIngestResponse
+}
+
+class VitalIngestRequest <<Pydantic>> {
+  +patient_id: int
+  +heart_rate: int
+  +spo2: float
+  +bp_sys: int
+  +bp_dia: int
+  +respiratory_rate: int
+  +temperature: float
+  +source: str
+}
+
+class VitalIngestResponse <<Pydantic>> {
+  +reading_id: int
+  +alert_created: bool
+  +risk_score: float
+  +severity: str | None
+}
+
+interface VitalSourceAdapter <<Protocol>> {
+  +adapt(payload: VitalIngestRequest): dict
+}
+
+class GenericVitalSourceAdapter {
+  +adapt(payload): dict
+}
+
+class SimulatorVitalSourceAdapter {
+  +adapt(payload): dict
+}
+
+class VitalSourceAdapterFactory <<factory>> {
+  +{static} create(source: str): VitalSourceAdapter
+}
+
+class VitalObservationContext <<dataclass>> {
+  +reading: VitalReading
+  +risk_score: float = 0.0
+  +should_alert: bool = False
+  +severity: AlertSeverity | None
+  +rule_code: str = "NORMAL"
+  +message: str = "No alert"
+}
+
+interface VitalObserver <<Protocol>> {
+  +update(context: VitalObservationContext): void
+}
+
+class VitalSubject <<subject>> {
+  -_observers: list<VitalObserver>
+  +attach(observer): void
+  +notify(context): void
+}
+
+class RiskScoreObserver {
+  +update(context): void
+}
+
+class AlertEvaluationObserver {
+  +update(context): void
+}
+
+class build_default_vital_subject <<module function>> {
+  +(): VitalSubject
+}
+
+class calculate_risk_score <<module function>> {
+  +(reading: VitalReading): float
+}
+
+class evaluate_alert <<module function>> {
+  +(reading, risk_score): (bool, severity, code, msg)
+}
+
+class build_event_envelope <<module function>> {
+  +(event_type, data, schema_version="1.0"): dict
+}
+
+class _publish_pending_outbox <<background fn>> {
+  +(): void
+  --
+  // publish_event(...) returns bool
+  // on success -> status=PUBLISHED, published_at=now()
+  // on failure -> status=FAILED, retry_count++, last_error="RabbitMQ publish failed"
+  // bridge unavailable -> last_error="RabbitMQ bridge unavailable"
+}
+
+class VitalReading {
+  +id, patient_id, ts,\n  heart_rate, spo2, bp_sys, bp_dia,\n  respiratory_rate, temperature, source
+}
+class Alert {
+  +id, patient_id, severity,\n  rule_code, message, status, ack_by, ack_at
+}
+class OutboxEvent {
+  +id, event_type, payload,\n  status: OutboxStatus, retry_count
+}
+class AuditLog {
+  +id, actor_username, action,\n  target_type, target_id, audit_metadata
+}
+
+IngestVitalsEndpoint --> VitalIngestRequest : <<consumes>>
+IngestVitalsEndpoint --> VitalIngestResponse : <<produces>>
+IngestVitalsEndpoint --> VitalSourceAdapterFactory : <<uses>>
+IngestVitalsEndpoint --> VitalSubject : notify(context)
+IngestVitalsEndpoint --> VitalObservationContext : <<creates>>
+IngestVitalsEndpoint --> VitalReading : <<creates>>
+IngestVitalsEndpoint --> Alert : <<creates if should_alert>>
+IngestVitalsEndpoint --> OutboxEvent : <<creates 1 or 3>>
+IngestVitalsEndpoint --> AuditLog : <<creates>>
+IngestVitalsEndpoint --> build_event_envelope : <<uses>>
+
+VitalSourceAdapterFactory ..> GenericVitalSourceAdapter : <<creates>>
+VitalSourceAdapterFactory ..> SimulatorVitalSourceAdapter : <<creates>>
+VitalSourceAdapter <|.. GenericVitalSourceAdapter
+VitalSourceAdapter <|.. SimulatorVitalSourceAdapter
+
+VitalObserver <|.. RiskScoreObserver
+VitalObserver <|.. AlertEvaluationObserver
+VitalSubject o--> "*" VitalObserver : observers
+VitalSubject ..> VitalObservationContext : <<notifies>>
+RiskScoreObserver ..> VitalObservationContext : <<updates>>
+AlertEvaluationObserver ..> VitalObservationContext : <<updates>>
+RiskScoreObserver ..> calculate_risk_score : <<uses>>
+AlertEvaluationObserver ..> evaluate_alert : <<uses>>
+build_default_vital_subject ..> VitalSubject : <<returns>>
+build_default_vital_subject ..> RiskScoreObserver : <<attaches>>
+build_default_vital_subject ..> AlertEvaluationObserver : <<attaches>>
+
+_publish_pending_outbox ..> OutboxEvent : <<reads PENDING/FAILED,\nupdates status>>
+
+@enduml

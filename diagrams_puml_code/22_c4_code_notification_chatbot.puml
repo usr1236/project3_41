@@ -1,0 +1,91 @@
+@startuml C4_Code_Notification_Chatbot
+title C4 Code Diagram (L4) - Chatbot Triage Implementation\n(zoom into the Chatbot component of Notification Service)
+
+skinparam classAttributeIconSize 0
+skinparam classFontSize 11
+skinparam classFontStyle plain
+skinparam wrapWidth 220
+
+class ChatbotEndpoint <<route>> {
+  +POST /v1/chatbot/message
+  --
+  +async chatbot_message(\n  payload: ChatbotMessageRequest,\n  db: Session,\n  current_user: User\n): ChatbotMessageResponse
+}
+
+class ChatbotMessageRequest <<Pydantic>> {
+  +message: str
+  +patient_id: int | None
+}
+
+class ChatbotMessageResponse <<Pydantic>> {
+  +reply: str
+  +risk_level: str
+  +strategy_used: str
+  +escalated: bool
+  +alert_id: int | None
+}
+
+class ChatbotTriageFactory <<factory>> {
+  +{static} create_response_adapter(): TriageResponseAdapter
+  +{static} create_strategies(): list<ChatbotTriageStrategy>
+}
+
+interface TriageResponseAdapter <<Protocol>> {
+  +adapt(raw_text: str): tuple<str, str>
+}
+
+class JsonTriageResponseAdapter {
+  +adapt(raw_text: str): tuple<str, str>
+}
+
+interface ChatbotTriageStrategy <<Protocol>> {
+  +name: str
+  +triage(message: str,\n  latest_vital: VitalReading | None\n): tuple<str, str>
+}
+
+class OpenAITriageStrategy {
+  +name = "openai"
+  -adapter: TriageResponseAdapter
+  +triage(message, latest_vital): tuple
+}
+
+class GeminiTriageStrategy {
+  +name = "gemini"
+  -adapter: TriageResponseAdapter
+  +triage(message, latest_vital): tuple
+}
+
+class LocalRulesTriageStrategy {
+  +name = "local_rules"
+  +triage(message, latest_vital): tuple
+}
+
+class _can_access_patient <<module function>> {
+  +(db, user, patient_id): bool
+}
+
+class create_audit_log <<module function>> {
+  +(db, actor_username, action,\n  target_type, target_id,\n  metadata): void
+}
+
+ChatbotEndpoint --> ChatbotMessageRequest : <<consumes>>
+ChatbotEndpoint --> ChatbotMessageResponse : <<produces>>
+ChatbotEndpoint --> ChatbotTriageFactory : <<uses>>
+ChatbotEndpoint --> _can_access_patient : <<uses>>
+ChatbotEndpoint --> create_audit_log : <<uses>>
+ChatbotEndpoint o--> "*" ChatbotTriageStrategy : strategies (ordered)
+
+ChatbotTriageFactory ..> JsonTriageResponseAdapter : <<creates>>
+ChatbotTriageFactory ..> OpenAITriageStrategy : <<creates>>
+ChatbotTriageFactory ..> GeminiTriageStrategy : <<creates>>
+ChatbotTriageFactory ..> LocalRulesTriageStrategy : <<creates>>
+
+TriageResponseAdapter <|.. JsonTriageResponseAdapter
+ChatbotTriageStrategy <|.. OpenAITriageStrategy
+ChatbotTriageStrategy <|.. GeminiTriageStrategy
+ChatbotTriageStrategy <|.. LocalRulesTriageStrategy
+
+OpenAITriageStrategy o--> "1" TriageResponseAdapter : shared
+GeminiTriageStrategy o--> "1" TriageResponseAdapter : shared
+
+@enduml

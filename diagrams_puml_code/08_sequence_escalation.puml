@@ -34,10 +34,6 @@ loop while case status == ACTIVE
         worker -> db : INSERT Notification\n(channel=IN_APP_ESCALATION,\nrecipient=resolved_username_or_fallback)
         worker -> db : UPDATE EscalationCase\n(step_index++, next_due_at=now+interval)
         worker -> db : AuditLog (ESCALATION_STEP_DISPATCHED)
-        opt escalation recipient delivery view
-            ws -> cg : Receive escalation notification (step 3)
-            ws -> adm : Receive escalation notification (step 4)
-        end
     end
 end
 
